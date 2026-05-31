@@ -2,3 +2,4 @@ requests>=2.31.0
 pandas>=2.0.0
 numpy>=1.24.0
 scipy>=1.11.0
+pytz>=2024.1
