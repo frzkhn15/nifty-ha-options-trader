@@ -1,0 +1,116 @@
+name: Nifty HA Options Trader
+
+# ── Triggers ──────────────────────────────────────────────────────────────────
+# 1. workflow_dispatch  — triggered via HTTP POST from cron-job.org at 9:15 AM IST
+#                         URL: https://api.github.com/repos/frzkhn155-ai/nifty-ha-options-trader/actions/workflows/run_trader.yml/dispatches
+# 2. Manual             — run anytime from the GitHub Actions tab
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Trading mode'
+        required: false
+        default: 'live'
+        type: choice
+        options:
+          - live
+          - signal_only
+
+# ── Permissions ───────────────────────────────────────────────────────────────
+permissions:
+  contents: read
+
+jobs:
+  run-trader:
+    name: Run Nifty HA Trader
+    runs-on: ubuntu-latest
+
+    # Safety: kill the job if it somehow runs past 15:45 IST (6h 30m from 9:15)
+    timeout-minutes: 390
+
+    env:
+      UPSTOX_TOKEN:      ${{ secrets.UPSTOX_TOKEN }}
+      UPSTOX_API_KEY:    ${{ secrets.UPSTOX_API_KEY }}
+      UPSTOX_API_SECRET: ${{ secrets.UPSTOX_API_SECRET }}
+      GROQ_API_KEY:      ${{ secrets.GROQ_API_KEY }}
+      TZ: Asia/Kolkata
+
+    steps:
+
+      # ── 1. Checkout ───────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Python setup ───────────────────────────────────────────────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # ── 3. Install dependencies ───────────────────────────────────────────
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # ── 4. Verify secrets are present ─────────────────────────────────────
+      - name: Verify environment
+        run: |
+          python3 - << 'EOF'
+          import os, sys
+          required = ["UPSTOX_TOKEN", "UPSTOX_API_KEY", "UPSTOX_API_SECRET"]
+          missing  = [k for k in required if not os.environ.get(k)]
+          if missing:
+              print(f"❌ Missing secrets: {', '.join(missing)}")
+              sys.exit(1)
+          print("✅ All required secrets present")
+          print(f"   TZ: {os.environ.get('TZ', 'not set')}")
+          print(f"   Mode input: ${{ github.event.inputs.mode || 'live' }}")
+          EOF
+
+      # ── 5. Override trading mode if signal_only was selected ──────────────
+      - name: Patch trading mode
+        if: ${{ github.event.inputs.mode == 'signal_only' }}
+        run: |
+          sed -i 's/^ENABLE_AUTO_TRADING = True/ENABLE_AUTO_TRADING = False/' nifty_ha_options_v3.py
+          echo "⚠️  Running in SIGNAL ONLY mode — no real orders will be placed"
+
+      # ── 6. Wait until 9:15 AM IST if triggered early ──────────────────────
+      - name: Wait for market open (9:15 AM IST)
+        run: |
+          python3 - << 'EOF'
+          import time
+          from datetime import datetime
+          import pytz
+
+          ist = pytz.timezone("Asia/Kolkata")
+          now = datetime.now(ist)
+          market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+
+          if now < market_open:
+              wait_secs = (market_open - now).total_seconds()
+              print(f"⏳ Waiting {wait_secs:.0f}s for market open at 09:15 IST ...")
+              time.sleep(wait_secs)
+          else:
+              print(f"✅ Already past 09:15 IST ({now.strftime('%H:%M:%S')}) — starting immediately")
+          EOF
+        env:
+          PYTHONPATH: .
+
+      # ── 7. Run the trader ─────────────────────────────────────────────────
+      - name: Run trader
+        run: |
+          echo "🚀 Starting Nifty HA Options Trader at $(date +'%H:%M:%S %Z')"
+          python3 nifty_ha_options_v3.py
+        timeout-minutes: 380
+
+      # ── 8. Upload logs as artifacts ───────────────────────────────────────
+      - name: Upload trade logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trade-logs-${{ github.run_id }}
+          path: |
+            nifty_ha_strategy.txt
+            nifty_ha_trades.csv
+          if-no-files-found: ignore
+          retention-days: 30
