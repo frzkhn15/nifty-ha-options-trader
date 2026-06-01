@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nifty 50 Options Trader — Heikin-Ashi Strategy  v3
+Nifty 50 Options Trader — Heikin-Ashi Strategy  v4
 ====================================================
 Single-strategy script. No multi-strategy bloat.
 
@@ -162,6 +162,18 @@ MAX_TRADES_PER_DAY = 3
 BIAS_STRONG_MIN_DELTA = 5.0    # delta >= this → STRONG bias
 BIAS_WEAK_MAX_DELTA   = 1.5    # delta <  this → WEAK  bias (skip trading)
 
+# ── v4: 15m intra-hour bias flip ──────────────────────────────────────────────
+# When the market makes a sustained move AGAINST the current bias, flip it.
+# Flip requires ALL of:
+#   1. BIAS_FLIP_CONSEC_CANDLES consecutive opposite-colour 15m HA bars
+#   2. Latest HA close moved >= BIAS_FLIP_MIN_MOVE pts against the bias
+#   3. >= BIAS_FLIP_COOLDOWN_MINS since the last flip (prevents thrashing)
+# Set ENABLE_BIAS_FLIP = False to restore original behaviour.
+ENABLE_BIAS_FLIP         = True
+BIAS_FLIP_CONSEC_CANDLES = 3      # 3 consecutive opposite HA bars
+BIAS_FLIP_MIN_MOVE       = 20.0   # HA close must move >= 20 pts against bias
+BIAS_FLIP_COOLDOWN_MINS  = 30     # minimum minutes between flips
+
 # ── v2: Preferred entry window ────────────────────────────────────────────────
 # Outside [ENTRY_WINDOW_START, ENTRY_WINDOW_END], the structure filter is
 # stricter (requires both lower-low AND lower-low-2 for bearish, etc.).
@@ -203,6 +215,8 @@ BIAS_OVERRIDE_ACTIVE   = False  # track if bias has been overridden for the curr
 PROCESSED_BIAS_CANDLES = set()  # 1H candle start times already used for bias
 BIAS_OVERRIDE_DONE_FOR = set()  # candle_close_time values for which override already ran
 _INITIAL_BIAS_SET      = False  # True once the 15-min comparison has fired for the day
+_LAST_BIAS_FLIP_TIME   = None   # datetime of last intra-hour bias flip (cooldown guard)
+_BIAS_SET_HA_CLOSE     = None   # HA close at the moment bias was last set (for move check)
 
 # ── v3: Option chain cache ────────────────────────────────────────────────────
 OPTION_CHAIN_CACHE: dict = {}       # {option_type: [contracts]}
@@ -847,6 +861,88 @@ def bearish_structure_ok(df: pd.DataFrame, bias_strength: str = "normal") -> boo
               f"lows {lows[-3]:.1f} → {lows[-2]:.1f} → {lows[-1]:.1f} — need lower lows")
     return ok
 
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v4: INTRA-HOUR BIAS FLIP  (15m HA reversal detector)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_15m_bias_flip(df_15m: pd.DataFrame) -> bool:
+    """
+    v4: Flip BIAS when the market makes a sustained move against it.
+
+    Conditions (all required):
+      1. Cooldown: >= BIAS_FLIP_COOLDOWN_MINS since last flip
+      2. Last BIAS_FLIP_CONSEC_CANDLES 15m HA bars all opposite colour
+      3. HA close moved >= BIAS_FLIP_MIN_MOVE pts against current bias
+         since bias was last set
+
+    Returns True if flipped, False otherwise.
+    """
+    global BIAS, BIAS_STRENGTH, BIAS_SET_AT, _LAST_BIAS_FLIP_TIME, _BIAS_SET_HA_CLOSE
+
+    if not ENABLE_BIAS_FLIP or BIAS is None:
+        return False
+    if df_15m is None or len(df_15m) < BIAS_FLIP_CONSEC_CANDLES + 1:
+        return False
+
+    # Cooldown
+    if _LAST_BIAS_FLIP_TIME is not None:
+        mins_since = (datetime.now() - _LAST_BIAS_FLIP_TIME).total_seconds() / 60
+        if mins_since < BIAS_FLIP_COOLDOWN_MINS:
+            return False
+
+    # Slice from when bias was set
+    if BIAS_SET_AT:
+        bias_floor = pd.Timestamp(BIAS_SET_AT).floor("15min")
+        df_check = df_15m[df_15m["datetime"] >= bias_floor]
+    else:
+        df_check = df_15m
+    if len(df_check) < BIAS_FLIP_CONSEC_CANDLES + 1:
+        return False
+
+    ha = compute_ha(df_check)
+    if len(ha) < BIAS_FLIP_CONSEC_CANDLES + 1:
+        return False
+
+    # Check consecutive opposite-colour bars
+    opposite = "green" if BIAS == "BEARISH" else "red"
+    last_n   = ha.iloc[-BIAS_FLIP_CONSEC_CANDLES:]
+    all_opposite = all(row["ha_color"] == opposite for _, row in last_n.iterrows())
+    if not all_opposite:
+        return False
+
+    # Check move magnitude
+    current_close = float(ha.iloc[-1]["ha_close"])
+    if _BIAS_SET_HA_CLOSE is not None:
+        move = current_close - _BIAS_SET_HA_CLOSE
+        move_ok = (move >= BIAS_FLIP_MIN_MOVE  if BIAS == "BEARISH"
+                   else move <= -BIAS_FLIP_MIN_MOVE)
+        if not move_ok:
+            if DEBUG_MODE:
+                print(f"   Flip candidate: {BIAS_FLIP_CONSEC_CANDLES}x {opposite} bars "
+                      f"but move only {move:+.1f} pts (need {BIAS_FLIP_MIN_MOVE:.0f})")
+            return False
+
+    # Flip!
+    old_bias = BIAS
+    new_bias = "BULLISH" if BIAS == "BEARISH" else "BEARISH"
+    print(f"\n{'='*70}")
+    print(f"BIAS FLIP: {old_bias} -> {new_bias} at {datetime.now().strftime('%H:%M:%S')}")
+    print(f"   Trigger: {BIAS_FLIP_CONSEC_CANDLES}x consecutive {opposite.upper()} HA bars")
+    if _BIAS_SET_HA_CLOSE:
+        print(f"   Move:    HA close {_BIAS_SET_HA_CLOSE:.1f} -> {current_close:.1f} "
+              f"({current_close - _BIAS_SET_HA_CLOSE:+.1f} pts)")
+    print(f"   Now scanning for {'CE' if new_bias == 'BULLISH' else 'PE'} entries")
+    print(f"{'='*70}\n")
+
+    BIAS               = new_bias
+    BIAS_STRENGTH      = "NORMAL"
+    BIAS_SET_AT        = datetime.now()
+    _LAST_BIAS_FLIP_TIME = datetime.now()
+    _BIAS_SET_HA_CLOSE = current_close
+    return True
 
 def scan_15m_for_entry(df_15m: pd.DataFrame, df_1h: Optional[pd.DataFrame] = None) -> Optional[dict]:
     """
@@ -1508,7 +1604,7 @@ def current_hhmm() -> str:
 
 def banner():
     print("\n" + "=" * 70)
-    print("  NIFTY 50 OPTIONS TRADER -- HEIKIN-ASHI STRATEGY v3 (Fixed API)")
+    print("  NIFTY 50 OPTIONS TRADER -- HEIKIN-ASHI STRATEGY v4 (Fixed API)")
     print("=" * 70)
     print(f"  Mode:          {'LIVE TRADING' if ENABLE_AUTO_TRADING else 'SIGNAL ONLY'}")
     print(f"  Entry:         After 10:30 AM | No new entries after {NO_NEW_ENTRY_AFTER}")
@@ -1531,12 +1627,16 @@ def banner():
     print(f"  1H tolerance:  ±{TREND_ALIGN_TOLERANCE} pts ({('strict (0=off)' if TREND_ALIGN_TOLERANCE == 0 else 'tolerant')})")
     print(f"  Chain cache:   {OPTION_CHAIN_CACHE_TTL}s TTL")
     print(f"  Type hints:    Optional[...] (Python 3.8+ compatible)")
+    print(f"  -- v4 additions --")
+    _fs = f"ON  ({BIAS_FLIP_CONSEC_CANDLES} bars + {BIAS_FLIP_MIN_MOVE:.0f}pt move, {BIAS_FLIP_COOLDOWN_MINS}m cooldown)" if ENABLE_BIAS_FLIP else "OFF"
+    print(f"  Bias flip:     {_fs}")
     print("=" * 70 + "\n")
 
 def main():
     global BIAS, BIAS_SET_AT, BIAS_STRENGTH, ACTIVE_POSITION, BIAS_OVERRIDE_ACTIVE, \
            PROCESSED_BIAS_CANDLES, BIAS_OVERRIDE_DONE_FOR, _INITIAL_BIAS_SET, \
-           DAILY_PNL, TRADES_TODAY
+           DAILY_PNL, TRADES_TODAY, _LAST_BIAS_FLIP_TIME, _BIAS_SET_HA_CLOSE, \
+           OPTION_CHAIN_CACHE, LAST_CHAIN_FETCH
 
     banner()
 
@@ -1577,6 +1677,8 @@ def main():
             print("   Restarting state for tomorrow...")
             BIAS, BIAS_SET_AT = None, None
             BIAS_STRENGTH = "NORMAL"
+            _LAST_BIAS_FLIP_TIME = None
+            _BIAS_SET_HA_CLOSE   = None
             PROCESSED_BIAS_CANDLES.clear()
             BIAS_OVERRIDE_DONE_FOR.clear()
             ACTIVE_POSITION = {}
@@ -1603,6 +1705,9 @@ def main():
                     BIAS_SET_AT   = now
                     BIAS_OVERRIDE_ACTIVE = False
                     _INITIAL_BIAS_SET = True
+                    if df_15m is not None and len(df_15m) >= 1:
+                        _ha_snap = compute_ha(df_15m)
+                        _BIAS_SET_HA_CLOSE = float(_ha_snap.iloc[-1]["ha_close"]) if len(_ha_snap) else None
                 else:
                     print("   ⚠️  Initial 15-min bias not ready yet (or WEAK bias) — will retry")
 
@@ -1624,6 +1729,12 @@ def main():
             #     check_bias_override() is self-throttled via BIAS_OVERRIDE_DONE_FOR.
             if current_hhmm() >= "10:30":
                 check_bias_override(df_15m)
+
+            # -- STEP 3b: Intra-hour bias flip check ─────────────────────────
+            if _INITIAL_BIAS_SET and not ACTIVE_POSITION:
+                if check_15m_bias_flip(df_15m):
+                    OPTION_CHAIN_CACHE.clear()
+                    LAST_CHAIN_FETCH = None
 
             # -- STEP 4: Monitor active position exits -------------------------
             if ACTIVE_POSITION:
