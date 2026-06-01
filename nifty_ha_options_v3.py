@@ -820,8 +820,8 @@ def bullish_structure_ok(df: pd.DataFrame, bias_strength: str = "normal") -> boo
     else:
         ok = highs[-1] > highs[-2] and highs[-2] > highs[-3]   # strict rising
     if not ok and DEBUG_MODE:
-        print(f"   ⛔ CE blocked — lower highs ({bias_strength}): "
-              f"{highs[-3]:.1f} → {highs[-2]:.1f} → {highs[-1]:.1f}")
+        print(f"   ⛔ Structure blocked (CE, {bias_strength}): "
+              f"highs {highs[-3]:.1f} → {highs[-2]:.1f} → {highs[-1]:.1f} — need higher highs")
     return ok
 
 
@@ -843,8 +843,8 @@ def bearish_structure_ok(df: pd.DataFrame, bias_strength: str = "normal") -> boo
     else:
         ok = lows[-1] < lows[-2] and lows[-2] < lows[-3]    # strict falling
     if not ok and DEBUG_MODE:
-        print(f"   ⛔ PE blocked — higher lows ({bias_strength}): "
-              f"{lows[-3]:.1f} → {lows[-2]:.1f} → {lows[-1]:.1f}")
+        print(f"   ⛔ Structure blocked (PE, {bias_strength}): "
+              f"lows {lows[-3]:.1f} → {lows[-2]:.1f} → {lows[-1]:.1f} — need lower lows")
     return ok
 
 
@@ -882,10 +882,14 @@ def scan_15m_for_entry(df_15m: pd.DataFrame, df_1h: Optional[pd.DataFrame] = Non
 
     # ── v2: 1H trend alignment ────────────────────────────────────────────────
     if not is_1h_trend_aligned(df_1h, BIAS):
+        if DEBUG_MODE:
+            print("   ⛔ Entry blocked: 1H trend not aligned")
         return None
 
     # ── v2: Volatility / range filter ─────────────────────────────────────────
     if not has_sufficient_range(df_15m):
+        if DEBUG_MODE:
+            print("   ⛔ Entry blocked: candle range too small (low volatility)")
         return None
 
     # Only use candles after bias was set
@@ -1634,11 +1638,10 @@ def main():
                     print(f"\n   🔔 Reversal pattern detected: {signal['signal']}")
                     execute_entry(signal)
                 elif DEBUG_MODE:
-                    # Show last 2 HA colours for transparency
+                    # Show last 2 HA colours + fire the pattern detector to expose
+                    # which sub-filter is blocking entry (body, close, shadow, structure).
                     if df_15m is not None and len(df_15m) >= 2:
                         if BIAS_SET_AT:
-                            # Floor bias set-time to 15-min boundary so the
-                            # filter always captures at least one closed bar
                             bias_floor = pd.Timestamp(BIAS_SET_AT).floor("15min")
                             ha_df = df_15m[df_15m["datetime"] >= bias_floor]
                             ha = compute_ha(ha_df) if len(ha_df) >= 2 else compute_ha(df_15m)
@@ -1647,7 +1650,21 @@ def main():
                         if len(ha) >= 2:
                             c1 = ha.iloc[-2]["ha_color"]
                             c2 = ha.iloc[-1]["ha_color"]
-                            print(f"   15m HA: [{c1}] -> [{c2}] | No pattern yet")
+                            last_ha  = ha.iloc[-1]
+                            prev_ha  = ha.iloc[-2]
+                            # Show candle detail alongside colours
+                            print(f"   15m HA: [{c1}] -> [{c2}] | "
+                                  f"prev close={prev_ha['ha_close']:.1f} low={prev_ha['ha_low']:.1f} | "
+                                  f"last close={last_ha['ha_close']:.1f} open={last_ha['ha_open']:.1f} | "
+                                  f"No pattern yet")
+                            # When colours look right but no signal fired, run detector
+                            # verbosely so the exact blocking filter is printed
+                            if BIAS == "BEARISH" and c1 == "green" and c2 == "red":
+                                print("   🔎 PE pattern check (green→red seen, checking all filters):")
+                                detect_early_reversal_pe(ha)
+                            elif BIAS == "BULLISH" and c1 == "red" and c2 == "green":
+                                print("   🔎 CE pattern check (red→green seen, checking all filters):")
+                                detect_early_reversal_ce(ha)
 
         # -- Single sleep point for every normal path --------------------------
         time.sleep(SCAN_INTERVAL_SECS)
