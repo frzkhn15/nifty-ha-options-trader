@@ -365,7 +365,7 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
     global _INITIAL_BIAS_SET
 
     if df_15m is None or df_15m.empty:
-        return None
+        return None, None
 
     now = datetime.now()
     today = now.date()
@@ -380,7 +380,7 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
         if DEBUG_MODE:
             eta = (h2_close_dt + timedelta(seconds=DATA_LAG_SECONDS) - now).seconds
             print(f"   15m bias: H2_first bar not yet confirmed — {eta}s remaining")
-        return None
+        return None, None
 
     # ── Locate the two bars in df_15m ─────────────────────────────────────────
     row_h1 = df_15m[df_15m["datetime"] == h1_last_ts]
@@ -390,14 +390,14 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
         if DEBUG_MODE:
             available = df_15m["datetime"].dt.strftime("%H:%M").tolist()
             print(f"   15m bias: Could not find reference bars. Available: {available[-10:]}")
-        return None
+        return None, None
 
     # ── Compute HA on a 2-bar slice (inherits context from full df_15m) ───────
     # Use the full df up to and including H2_first so HA seed is stable.
     ha_full = compute_ha(df_15m[df_15m["datetime"] <= h2_first_ts].copy())
 
     if len(ha_full) < 2:
-        return None
+        return None, None
 
     # Extract the two reference rows from the full HA series
     ha_h1 = ha_full[ha_full["datetime"] == h1_last_ts]
@@ -406,7 +406,7 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
     if ha_h1.empty or ha_h2.empty:
         if DEBUG_MODE:
             print("   15m bias: HA rows for reference bars not found after compute_ha")
-        return None
+        return None, None
 
     h1_ha_close = ha_h1.iloc[0]["ha_close"]
     h2_ha_close = ha_h2.iloc[0]["ha_close"]
