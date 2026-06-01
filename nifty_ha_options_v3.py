@@ -258,10 +258,19 @@ def fetch_1min_intraday() -> Optional[pd.DataFrame]:
 
 
 def resample_to(df: pd.DataFrame, rule: str, offset: Optional[str] = None) -> Optional[pd.DataFrame]:
-    """Resample 1-minute DataFrame to a higher timeframe."""
+    """
+    Resample 1-minute DataFrame to a higher timeframe.
+
+    Normalizes all timestamps to tz-naive minute-floored values so that
+    exact pd.Timestamp equality lookups work reliably (no sub-second or
+    timezone offset surprises from the Upstox API response).
+    """
     if df is None or df.empty:
         return None
-    df_idx = df.set_index("datetime")[["open", "high", "low", "close", "volume"]]
+    src = df.copy()
+    # Strip tz and floor to minute before resampling
+    src["datetime"] = pd.to_datetime(src["datetime"]).dt.tz_localize(None).dt.floor("min")
+    df_idx = src.set_index("datetime")[["open", "high", "low", "close", "volume"]]
     kwargs = {"offset": offset} if offset else {}
     resampled = df_idx.resample(rule, **kwargs).agg({
         "open":   "first",
@@ -271,6 +280,8 @@ def resample_to(df: pd.DataFrame, rule: str, offset: Optional[str] = None) -> Op
         "volume": "sum",
     }).dropna()
     resampled = resampled.reset_index()
+    # Normalize output: tz-naive, floored to minute, no sub-second noise
+    resampled["datetime"] = pd.to_datetime(resampled["datetime"]).dt.tz_localize(None).dt.floor("min")
     return resampled
 
 
@@ -383,6 +394,12 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
         return None, None
 
     # ── Locate the two bars in df_15m ─────────────────────────────────────────
+    # Floor both sides to minute to guard against any residual sub-second noise
+    df_15m = df_15m.copy()
+    df_15m["datetime"] = pd.to_datetime(df_15m["datetime"]).dt.floor("min")
+    h1_last_ts  = h1_last_ts.floor("min")
+    h2_first_ts = h2_first_ts.floor("min")
+
     row_h1 = df_15m[df_15m["datetime"] == h1_last_ts]
     row_h2 = df_15m[df_15m["datetime"] == h2_first_ts]
 
@@ -390,6 +407,7 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
         if DEBUG_MODE:
             available = df_15m["datetime"].dt.strftime("%H:%M").tolist()
             print(f"   15m bias: Could not find reference bars. Available: {available[-10:]}")
+            print(f"   Looking for: {h1_last_ts.strftime('%H:%M')} and {h2_first_ts.strftime('%H:%M')}")
         return None, None
 
     # ── Compute HA on a 2-bar slice (inherits context from full df_15m) ───────
