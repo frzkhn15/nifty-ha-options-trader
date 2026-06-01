@@ -889,7 +889,10 @@ def scan_15m_for_entry(df_15m: pd.DataFrame, df_1h: Optional[pd.DataFrame] = Non
         return None
 
     # Only use candles after bias was set
-    df_15m = df_15m[df_15m["datetime"] >= pd.Timestamp(BIAS_SET_AT.replace(second=0, microsecond=0))]
+    # Floor to 15-min boundary — BIAS_SET_AT is a wall-clock time (e.g. 10:38)
+    # that falls between 15m bars; without flooring the filter would return 0 rows.
+    bias_floor = pd.Timestamp(BIAS_SET_AT).floor("15min")
+    df_15m = df_15m[df_15m["datetime"] >= bias_floor]
     if len(df_15m) < 2:
         return None
 
@@ -1633,9 +1636,14 @@ def main():
                 elif DEBUG_MODE:
                     # Show last 2 HA colours for transparency
                     if df_15m is not None and len(df_15m) >= 2:
-                        ha = compute_ha(
-                            df_15m[df_15m["datetime"] >= pd.Timestamp(BIAS_SET_AT)]
-                        ) if BIAS_SET_AT else compute_ha(df_15m)
+                        if BIAS_SET_AT:
+                            # Floor bias set-time to 15-min boundary so the
+                            # filter always captures at least one closed bar
+                            bias_floor = pd.Timestamp(BIAS_SET_AT).floor("15min")
+                            ha_df = df_15m[df_15m["datetime"] >= bias_floor]
+                            ha = compute_ha(ha_df) if len(ha_df) >= 2 else compute_ha(df_15m)
+                        else:
+                            ha = compute_ha(df_15m)
                         if len(ha) >= 2:
                             c1 = ha.iloc[-2]["ha_color"]
                             c2 = ha.iloc[-1]["ha_color"]
