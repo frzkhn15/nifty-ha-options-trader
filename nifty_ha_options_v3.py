@@ -173,6 +173,8 @@ ENABLE_BIAS_FLIP         = True
 BIAS_FLIP_CONSEC_CANDLES = 3      # 3 consecutive opposite HA bars
 BIAS_FLIP_MIN_MOVE       = 20.0   # HA close must move >= 20 pts against bias
 BIAS_FLIP_COOLDOWN_MINS  = 30     # minimum minutes between flips
+BIAS_FLIP_1H_BYPASS_MINS = 60     # after a bias flip, bypass 1H filter for this long
+                                   # (the pre-flip 1H candle is stale/inverted)
 
 # ── v2: Preferred entry window ────────────────────────────────────────────────
 # Outside [ENTRY_WINDOW_START, ENTRY_WINDOW_END], the structure filter is
@@ -215,7 +217,8 @@ BIAS_OVERRIDE_ACTIVE   = False  # track if bias has been overridden for the curr
 PROCESSED_BIAS_CANDLES = set()  # 1H candle start times already used for bias
 BIAS_OVERRIDE_DONE_FOR = set()  # candle_close_time values for which override already ran
 _INITIAL_BIAS_SET      = False  # True once the 15-min comparison has fired for the day
-_LAST_BIAS_FLIP_TIME   = None   # datetime of last intra-hour bias flip (cooldown guard)
+_LAST_BIAS_FLIP_TIME    = None   # datetime of last intra-hour bias flip (cooldown guard)
+_BIAS_FLIP_BYPASS_UNTIL = None   # datetime until which 1H filter is bypassed post-flip
 _BIAS_SET_HA_CLOSE     = None   # HA close at the moment bias was last set (for move check)
 
 # ── v3: Option chain cache ────────────────────────────────────────────────────
@@ -390,7 +393,7 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
     global _INITIAL_BIAS_SET
 
     if df_15m is None or df_15m.empty:
-        return None, None
+        return None, None, None
 
     now = datetime.now()
     today = now.date()
@@ -405,7 +408,7 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
         if DEBUG_MODE:
             eta = (h2_close_dt + timedelta(seconds=DATA_LAG_SECONDS) - now).seconds
             print(f"   15m bias: H2_first bar not yet confirmed — {eta}s remaining")
-        return None, None
+        return None, None, None
 
     # ── Locate the two bars in df_15m ─────────────────────────────────────────
     # Floor both sides to minute to guard against any residual sub-second noise
@@ -422,14 +425,14 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
             available = df_15m["datetime"].dt.strftime("%H:%M").tolist()
             print(f"   15m bias: Could not find reference bars. Available: {available[-10:]}")
             print(f"   Looking for: {h1_last_ts.strftime('%H:%M')} and {h2_first_ts.strftime('%H:%M')}")
-        return None, None
+        return None, None, None
 
     # ── Compute HA on a 2-bar slice (inherits context from full df_15m) ───────
     # Use the full df up to and including H2_first so HA seed is stable.
     ha_full = compute_ha(df_15m[df_15m["datetime"] <= h2_first_ts].copy())
 
     if len(ha_full) < 2:
-        return None, None
+        return None, None, None
 
     # Extract the two reference rows from the full HA series
     ha_h1 = ha_full[ha_full["datetime"] == h1_last_ts]
@@ -438,7 +441,7 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
     if ha_h1.empty or ha_h2.empty:
         if DEBUG_MODE:
             print("   15m bias: HA rows for reference bars not found after compute_ha")
-        return None, None
+        return None, None, None
 
     h1_ha_close = ha_h1.iloc[0]["ha_close"]
     h2_ha_close = ha_h2.iloc[0]["ha_close"]
@@ -461,7 +464,7 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
         print(f"      → H2 close BELOW H1 close by {delta:.1f} pts  →  BEARISH (PE)")
     else:
         print(f"      → H2 close == H1 close ({h2_ha_close:.1f})  →  No conviction; will retry")
-        return None, None
+        return None, None, None
 
     # ── v2: Grade bias strength ───────────────────────────────────────────────
     if delta >= BIAS_STRONG_MIN_DELTA:
@@ -469,12 +472,14 @@ def determine_initial_bias_15m(df_15m: pd.DataFrame) -> tuple:
     elif delta < BIAS_WEAK_MAX_DELTA:
         strength = "WEAK"
         print(f"      ⚠️  Bias delta {delta:.1f} < {BIAS_WEAK_MAX_DELTA} threshold → WEAK bias → skipping trading today")
-        return None, None   # treat WEAK same as no bias — don't trade
+        return None, None, None   # treat WEAK same as no bias — don't trade
     else:
         strength = "NORMAL"
 
     print(f"      Bias strength: {strength} (delta {delta:.1f} pts)")
-    return bias, strength
+    # Return h2_ha_close so caller can anchor the flip reference to the actual
+    # bias determination point (not the live candle, which may already have moved).
+    return bias, strength, h2_ha_close
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -641,6 +646,14 @@ def is_1h_trend_aligned(df_1h: pd.DataFrame, bias: str) -> bool:
     (fail-open: don't block trades just because 1H data is thin).
     """
     if not ENABLE_1H_TREND_FILTER:
+        return True
+    # Post-flip bypass: the 1H candle that formed before the flip is inverted
+    # relative to the new bias — honouring it would block every valid entry
+    # for the next 30-60 minutes.  Skip the filter until a fresh 1H candle closes.
+    if _BIAS_FLIP_BYPASS_UNTIL is not None and datetime.now() < _BIAS_FLIP_BYPASS_UNTIL:
+        remaining = int((_BIAS_FLIP_BYPASS_UNTIL - datetime.now()).total_seconds() / 60)
+        if DEBUG_MODE:
+            print(f"   1H filter: bypassed post-flip ({remaining}m remaining)")
         return True
     if df_1h is None or len(df_1h) < 2:
         if DEBUG_MODE:
@@ -880,7 +893,7 @@ def check_15m_bias_flip(df_15m: pd.DataFrame) -> bool:
 
     Returns True if flipped, False otherwise.
     """
-    global BIAS, BIAS_STRENGTH, BIAS_SET_AT, _LAST_BIAS_FLIP_TIME, _BIAS_SET_HA_CLOSE
+    global BIAS, BIAS_STRENGTH, BIAS_SET_AT, _LAST_BIAS_FLIP_TIME, _BIAS_SET_HA_CLOSE, _BIAS_FLIP_BYPASS_UNTIL
 
     if not ENABLE_BIAS_FLIP or BIAS is None:
         return False
@@ -937,11 +950,14 @@ def check_15m_bias_flip(df_15m: pd.DataFrame) -> bool:
     print(f"   Now scanning for {'CE' if new_bias == 'BULLISH' else 'PE'} entries")
     print(f"{'='*70}\n")
 
-    BIAS               = new_bias
-    BIAS_STRENGTH      = "NORMAL"
-    BIAS_SET_AT        = datetime.now()
-    _LAST_BIAS_FLIP_TIME = datetime.now()
-    _BIAS_SET_HA_CLOSE = current_close
+    BIAS                    = new_bias
+    BIAS_STRENGTH           = "NORMAL"
+    BIAS_SET_AT             = datetime.now()
+    _LAST_BIAS_FLIP_TIME    = datetime.now()
+    _BIAS_SET_HA_CLOSE      = current_close
+    _BIAS_FLIP_BYPASS_UNTIL = datetime.now() + timedelta(minutes=BIAS_FLIP_1H_BYPASS_MINS)
+    print(f"   1H filter bypassed until {_BIAS_FLIP_BYPASS_UNTIL.strftime('%H:%M')} "
+          f"(pre-flip 1H candle is stale)")
     return True
 
 def scan_15m_for_entry(df_15m: pd.DataFrame, df_1h: Optional[pd.DataFrame] = None) -> Optional[dict]:
@@ -1636,6 +1652,7 @@ def main():
     global BIAS, BIAS_SET_AT, BIAS_STRENGTH, ACTIVE_POSITION, BIAS_OVERRIDE_ACTIVE, \
            PROCESSED_BIAS_CANDLES, BIAS_OVERRIDE_DONE_FOR, _INITIAL_BIAS_SET, \
            DAILY_PNL, TRADES_TODAY, _LAST_BIAS_FLIP_TIME, _BIAS_SET_HA_CLOSE, \
+           _BIAS_FLIP_BYPASS_UNTIL, \
            OPTION_CHAIN_CACHE, LAST_CHAIN_FETCH
 
     banner()
@@ -1677,8 +1694,11 @@ def main():
             print("   Restarting state for tomorrow...")
             BIAS, BIAS_SET_AT = None, None
             BIAS_STRENGTH = "NORMAL"
-            _LAST_BIAS_FLIP_TIME = None
-            _BIAS_SET_HA_CLOSE   = None
+            _LAST_BIAS_FLIP_TIME     = None
+            _BIAS_SET_HA_CLOSE      = None
+            _BIAS_FLIP_BYPASS_UNTIL = None
+            OPTION_CHAIN_CACHE.clear()          # clear stale option chain
+            LAST_CHAIN_FETCH   = None
             PROCESSED_BIAS_CANDLES.clear()
             BIAS_OVERRIDE_DONE_FOR.clear()
             ACTIVE_POSITION = {}
@@ -1696,18 +1716,30 @@ def main():
             #   Compare last 15-min bar of Hour-1 (10:00) vs first 15-min bar
             #   of Hour-2 (10:15).  Fire only after 10:30 + DATA_LAG_SECONDS.
             if not _INITIAL_BIAS_SET and t >= "10:30":
-                init_bias, init_strength = determine_initial_bias_15m(df_15m)
+                init_bias, init_strength, init_ha_close = determine_initial_bias_15m(df_15m)
                 if init_bias is not None:
                     print(f"   ✅ Initial bias set: {init_bias} ({init_strength}) at {now.strftime('%H:%M:%S')} "
                           f"(15-min comparison)")
-                    BIAS          = init_bias
-                    BIAS_STRENGTH = init_strength
-                    BIAS_SET_AT   = now
+                    BIAS               = init_bias
+                    BIAS_STRENGTH      = init_strength
+                    BIAS_SET_AT        = now
                     BIAS_OVERRIDE_ACTIVE = False
-                    _INITIAL_BIAS_SET = True
-                    if df_15m is not None and len(df_15m) >= 1:
-                        _ha_snap = compute_ha(df_15m)
-                        _BIAS_SET_HA_CLOSE = float(_ha_snap.iloc[-1]["ha_close"]) if len(_ha_snap) else None
+                    _INITIAL_BIAS_SET  = True
+                    # Anchor flip reference to H2_first HA close — the actual
+                    # bias determination point. Prevents the "already-moved
+                    # candle" bug when the script starts late.
+                    _BIAS_SET_HA_CLOSE = init_ha_close
+                    if now.strftime("%H:%M") > "10:45":
+                        mins_late = (now - now.replace(hour=10, minute=30, second=0, microsecond=0)).seconds // 60
+                        print(f"   ⚠️  Script started {mins_late}m late — bias anchored to H2_first "
+                              f"HA close ({init_ha_close:.1f}) not live candle.")
+                        # Bypass the 1H filter: the current 1H candle formed while
+                        # we weren't running — it may show counter-move that pre-dates
+                        # the bias decision and should not block entries.
+                        _BIAS_FLIP_BYPASS_UNTIL = now + timedelta(minutes=BIAS_FLIP_1H_BYPASS_MINS)
+                        print(f"   ⏭️  1H filter bypassed until "
+                              f"{_BIAS_FLIP_BYPASS_UNTIL.strftime('%H:%M')} "
+                              f"(pre-start 1H candle is stale)")
                 else:
                     print("   ⚠️  Initial 15-min bias not ready yet (or WEAK bias) — will retry")
 
