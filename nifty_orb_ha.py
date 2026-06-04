@@ -8,8 +8,16 @@ STRATEGY RULES:
   2. Entry signals  : 15m standard candle close > High1 → CE
                       15m standard candle close < Low1  → PE
                       Signals only accepted 10:30–13:00
-  3. HA Filter      : Entry allowed only if last CLOSED 1H HA candle
-                      agrees with direction (green for CE, red for PE)
+  3. HA Filter      : Configurable via HA_FILTER_MODE (see config):
+       "STRICT"  : Closed 1H HA must be green (CE) / red (PE)       [default]
+       "RELAXED" : Closed 1H HA close >= open + RELAXED_TICKS (CE)  [Option A]
+                   Allows doji/near-flat candles, blocks only deeply opposing
+       "REVERSAL": 15m breakout against HA direction is taken as a reversal
+                   entry, but initial SL tightened to breakout candle low/high
+                   instead of ORB level  [Option B — aggressive]
+       "LIVE_HA" : Watches the LIVE (unclosed) 1H HA candle; enters when it
+                   is already turning in the right direction even before it
+                   closes  [Option C — earliest entry]
   4. Initial SL     : CE → Low1  |  PE → High1
   5. Trailing SL    : 15m swing low (for CE) / swing high (for PE)
                       using ta.pivotlow equivalent in pandas
@@ -64,6 +72,31 @@ ORDER_QUANTITY      = 1          # lots
 ORDER_PRODUCT           = "I"
 OPTION_CHAIN_CACHE_TTL  = 600
 
+# ── HA Filter mode ───────────────────────────────────────────────────────────
+# Controls how the 1H HA is used to gate entry signals (Step 3).
+#
+#   "STRICT"   Original rule: closed 1H HA candle must be green (CE) / red (PE).
+#              Safest — misses early reversals but avoids whipsaws.
+#
+#   "RELAXED"  Option A: closed 1H HA close >= open + RELAXED_TICKS for CE
+#              (or close <= open - RELAXED_TICKS for PE).
+#              Allows doji-like (flat/near-flat) candles, blocks only deeply
+#              opposing ones.  Good balance of responsiveness vs safety.
+#
+#   "REVERSAL" Option B: enter even if 1H HA opposes direction (pure reversal
+#              play).  Initial SL is tightened to breakout candle low/high
+#              instead of ORB Low1/High1.  Aggressive — use only when you see
+#              a clear breakout candle pattern (e.g. bullish engulfing).
+#
+#   "LIVE_HA"  Option C: check the LIVE (unclosed) 1H HA candle.  Enter as
+#              soon as the live HA is turning in the right direction (close
+#              above open for CE, below for PE) — before the hour closes.
+#              Earliest possible entry; requires tight risk management.
+
+HA_FILTER_MODE   = "STRICT"   # "STRICT" | "RELAXED" | "REVERSAL" | "LIVE_HA"
+RELAXED_TICKS    = 2          # Option A: min pts that HA close must exceed open
+                               # (use 0 to allow pure doji)
+
 # Comfort tightening
 ENABLE_COMFORT_TIGHTEN  = True
 
@@ -73,7 +106,8 @@ DEBUG_MODE          = True
 LOG_FILE            = "nifty_orb_ha.txt"
 CSV_FILE            = "nifty_orb_ha_trades.csv"
 
-CSV_HEADERS = ["date", "signal", "entry_px", "entry_time",
+CSV_HEADERS = ["date", "signal", "filter_mode", "tight_sl",
+               "entry_px", "entry_time",
                "exit_px", "exit_time", "exit_reason", "pnl",
                "orb_high", "orb_low", "symbol", "order_id"]
 
@@ -265,6 +299,25 @@ def get_last_closed_1h_ha_color(df_1h: pd.DataFrame) -> str:
     return str(ha.iloc[-2]["ha_color"])
 
 
+def get_closed_1h_ha_row(df_1h: pd.DataFrame) -> Optional[pd.Series]:
+    """Returns the last CLOSED 1H HA candle as a Series (for RELAXED mode)."""
+    if df_1h is None or len(df_1h) < 2:
+        return None
+    return compute_ha(df_1h).iloc[-2]
+
+
+def get_live_ha_delta(df_1h: pd.DataFrame) -> Optional[float]:
+    """
+    For LIVE_HA mode: returns (ha_close - ha_open) of the currently forming
+    1H HA candle.  Positive = turning green, negative = turning red.
+    """
+    if df_1h is None or len(df_1h) < 1:
+        return None
+    ha = compute_ha(df_1h)
+    row = ha.iloc[-1]
+    return float(row["ha_close"] - row["ha_open"])
+
+
 def get_live_1h_ha_color(df_1h: pd.DataFrame) -> str:
     """
     Returns colour of the CURRENTLY FORMING 1H HA candle (iloc[-1]).
@@ -304,35 +357,99 @@ def scan_entry(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[dict]:
         return None
 
     LAST_CHECKED_BAR = bar_time
-    ha_color = get_last_closed_1h_ha_color(df_1h)
+    ha_row      = get_closed_1h_ha_row(df_1h)
+    ha_color    = get_last_closed_1h_ha_color(df_1h)
+    live_delta  = get_live_ha_delta(df_1h)    # for LIVE_HA mode
+
+    if ha_row is not None:
+        ha_delta = float(ha_row["ha_close"] - ha_row["ha_open"])
+    else:
+        ha_delta = 0.0
 
     if DEBUG_MODE:
-        print(f"   15m bar [{bar_time.strftime('%H:%M')}] "
-              f"close={bar['close']:.2f} | "
-              f"ORB H={ORB_HIGH:.2f} L={ORB_LOW:.2f} | "
-              f"1H HA={ha_color}")
+        live_str = f"{live_delta:+.1f}" if live_delta is not None else "n/a"
+        print(f"   [{bar_time.strftime('%H:%M')}] "
+              f"close={bar['close']:.2f} | ORB H={ORB_HIGH:.2f} L={ORB_LOW:.2f} | "
+              f"1H HA closed={ha_color}({ha_delta:+.1f}pts) live_delta={live_str} | "
+              f"mode={HA_FILTER_MODE}")
 
-    # CE signal
-    if bar["close"] > ORB_HIGH and ha_color == "green":
-        print(f"\n   ✅ CE SIGNAL: 15m close {bar['close']:.2f} > ORB High {ORB_HIGH:.2f} | "
-              f"1H HA green ✓")
-        return {"signal": "CE", "bar_time": bar_time,
-                "bar_close": bar["close"], "ha_color": ha_color}
+    # ── CE breakout ────────────────────────────────────────────────────────────
+    if bar["close"] > ORB_HIGH:
+        ce_ok     = False
+        tight_sl  = False   # True → use breakout candle low as SL (Option B)
+        reason    = ""
 
-    # PE signal
-    if bar["close"] < ORB_LOW and ha_color == "red":
-        print(f"\n   ✅ PE SIGNAL: 15m close {bar['close']:.2f} < ORB Low {ORB_LOW:.2f} | "
-              f"1H HA red ✓")
-        return {"signal": "PE", "bar_time": bar_time,
-                "bar_close": bar["close"], "ha_color": ha_color}
+        if HA_FILTER_MODE == "STRICT":
+            ce_ok  = (ha_color == "green")
+            reason = f"1H HA {ha_color} (need green)"
 
-    # Filter rejection messages
-    if bar["close"] > ORB_HIGH and ha_color != "green":
-        if DEBUG_MODE:
-            print(f"   ⛔ CE blocked: 1H HA is {ha_color} (need green)")
-    if bar["close"] < ORB_LOW and ha_color != "red":
-        if DEBUG_MODE:
-            print(f"   ⛔ PE blocked: 1H HA is {ha_color} (need red)")
+        elif HA_FILTER_MODE == "RELAXED":
+            # Allow if closed HA is NOT deeply red (delta >= -RELAXED_TICKS)
+            ce_ok  = (ha_delta >= -RELAXED_TICKS)
+            reason = f"1H HA delta {ha_delta:+.1f} < -{RELAXED_TICKS} ticks"
+
+        elif HA_FILTER_MODE == "REVERSAL":
+            # Always take the breakout; if HA is red, tighten SL to bar low
+            ce_ok   = True
+            tight_sl = (ha_color == "red")
+            reason  = ""
+
+        elif HA_FILTER_MODE == "LIVE_HA":
+            # Enter if live (unclosed) 1H HA is turning green (delta > 0)
+            ce_ok  = (live_delta is not None and live_delta > 0)
+            reason = f"live 1H HA delta {live_delta:+.1f} (need > 0)"
+
+        if ce_ok:
+            mode_note = (f"tight SL to bar low {bar['low']:.2f}" if tight_sl
+                         else f"1H HA {ha_color} ({HA_FILTER_MODE})")
+            print(f"\n   ✅ CE SIGNAL [{HA_FILTER_MODE}]: "
+                  f"close {bar['close']:.2f} > ORB High {ORB_HIGH:.2f} | {mode_note}")
+            return {"signal": "CE", "bar_time": bar_time,
+                    "bar_close": bar["close"], "bar_low": bar["low"],
+                    "bar_high": bar["high"],
+                    "ha_color": ha_color, "tight_sl": tight_sl,
+                    "filter_mode": HA_FILTER_MODE}
+        else:
+            if DEBUG_MODE:
+                print(f"   ⛔ CE blocked [{HA_FILTER_MODE}]: {reason}")
+
+    # ── PE breakout ────────────────────────────────────────────────────────────
+    if bar["close"] < ORB_LOW:
+        pe_ok     = False
+        tight_sl  = False
+        reason    = ""
+
+        if HA_FILTER_MODE == "STRICT":
+            pe_ok  = (ha_color == "red")
+            reason = f"1H HA {ha_color} (need red)"
+
+        elif HA_FILTER_MODE == "RELAXED":
+            # Allow if closed HA is NOT deeply green (delta <= RELAXED_TICKS)
+            pe_ok  = (ha_delta <= RELAXED_TICKS)
+            reason = f"1H HA delta {ha_delta:+.1f} > +{RELAXED_TICKS} ticks"
+
+        elif HA_FILTER_MODE == "REVERSAL":
+            pe_ok   = True
+            tight_sl = (ha_color == "green")
+            reason  = ""
+
+        elif HA_FILTER_MODE == "LIVE_HA":
+            pe_ok  = (live_delta is not None and live_delta < 0)
+            reason = f"live 1H HA delta {live_delta:+.1f} (need < 0)"
+
+        if pe_ok:
+            mode_note = (f"tight SL to bar high {bar['high']:.2f}" if tight_sl
+                         else f"1H HA {ha_color} ({HA_FILTER_MODE})")
+            print(f"\n   ✅ PE SIGNAL [{HA_FILTER_MODE}]: "
+                  f"close {bar['close']:.2f} < ORB Low {ORB_LOW:.2f} | {mode_note}")
+            return {"signal": "PE", "bar_time": bar_time,
+                    "bar_close": bar["close"], "bar_low": bar["low"],
+                    "bar_high": bar["high"],
+                    "ha_color": ha_color, "tight_sl": tight_sl,
+                    "filter_mode": HA_FILTER_MODE}
+        else:
+            if DEBUG_MODE:
+                print(f"   ⛔ PE blocked [{HA_FILTER_MODE}]: {reason}")
 
     return None
 
@@ -561,15 +678,23 @@ def execute_entry(signal: dict):
     lot_size  = contract.get("lot_size", OPTION_LOT_SIZE)
     qty       = lot_size * ORDER_QUANTITY
     entry_lmt = round(premium * 1.02, 2)
-    # Initial SL = ORB level (Low1 for CE, High1 for PE)
-    init_stop = ORB_LOW if opt == "CE" else ORB_HIGH
-    sl_lmt    = round(init_stop * 0.995 if opt == "CE"
-                      else init_stop * 1.005, 2)
+    # Initial SL: REVERSAL mode uses breakout candle low/high for tighter stop
+    tight_sl = signal.get("tight_sl", False)
+    if tight_sl:
+        # Option B: tighten to breakout candle low (CE) / high (PE)
+        init_stop = (round(signal["bar_low"]  - TICK, 2) if opt == "CE"
+                     else round(signal["bar_high"] + TICK, 2))
+        sl_note = f"breakout candle {'low' if opt == 'CE' else 'high'}"
+    else:
+        init_stop = ORB_LOW if opt == "CE" else ORB_HIGH
+        sl_note   = "ORB level"
+    sl_lmt = round(init_stop * 0.995 if opt == "CE" else init_stop * 1.005, 2)
 
     print(f"   Option:  {contract.get('trading_symbol')}")
     print(f"   Spot:    {spot:.0f} | Strike: {contract['strike_price']} | "
           f"Expiry: {contract['expiry']}")
-    print(f"   Premium: ₹{premium:.2f} | Initial SL: ₹{init_stop:.2f} (ORB level)")
+    print(f"   Premium: ₹{premium:.2f} | Filter: {signal.get('filter_mode','STRICT')}")
+    print(f"   Initial SL: ₹{init_stop:.2f} ({sl_note})")
 
     TRADE_TAKEN        = True
     COMFORT_TIGHTENED  = False
@@ -725,6 +850,8 @@ def check_exit(df_15m: Optional[pd.DataFrame] = None,
 def _log_entry(signal, contract, premium, spot, order_id):
     with open(LOG_FILE, "a") as f:
         f.write(f"\nENTRY {datetime.now()} | {signal['signal']} | "
+                f"mode={signal.get('filter_mode','STRICT')} | "
+                f"tight_sl={signal.get('tight_sl', False)} | "
                 f"bar={signal['bar_time'].strftime('%H:%M')} | "
                 f"close={signal['bar_close']:.2f} | "
                 f"ORB H={ORB_HIGH:.2f} L={ORB_LOW:.2f} | "
@@ -733,7 +860,9 @@ def _log_entry(signal, contract, premium, spot, order_id):
 
 
 def _log_exit(pos, exit_px, reason, pnl, pnl_p):
+    sig = pos.get("signal", {})
     row = [date.today().isoformat(), pos["type"],
+           sig.get("filter_mode", "STRICT"), sig.get("tight_sl", False),
            pos["entry"], pos["time"].strftime("%H:%M:%S"),
            exit_px, datetime.now().strftime("%H:%M:%S"),
            reason, f"{pnl:+.0f}",
@@ -761,7 +890,13 @@ def banner():
     print(f"  Mode          : {'LIVE' if ENABLE_AUTO_TRADING else 'SIGNAL ONLY'}")
     print(f"  Opening range : 09:15–10:15 (first 1H HA candle)")
     print(f"  Entry window  : {ENTRY_START}–{ENTRY_END} (15m breakout)")
-    print(f"  HA filter     : Last closed 1H HA must agree with direction")
+    mode_desc = {
+        "STRICT"  : "Closed 1H HA must agree (green/red)",
+        "RELAXED" : f"Closed HA delta >= -{RELAXED_TICKS} ticks (allows doji/flat)",
+        "REVERSAL": "Reversal play — breakout taken regardless, SL tightened to bar",
+        "LIVE_HA" : "Live (unclosed) 1H HA must be turning in entry direction",
+    }.get(HA_FILTER_MODE, HA_FILTER_MODE)
+    print(f"  HA filter     : [{HA_FILTER_MODE}] {mode_desc}")
     print(f"  Initial SL    : ORB Low1 (CE) / High1 (PE)")
     print(f"  Trailing SL   : 15m swing points (lookback {SWING_BARS} bars each side)")
     print(f"  Comfort tight : {'ON' if ENABLE_COMFORT_TIGHTEN else 'OFF'} "
