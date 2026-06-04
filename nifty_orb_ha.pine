@@ -1,6 +1,6 @@
 //@version=5
 strategy(
-     title            = "Nifty ORB — Heikin-Ashi Filter (1H range / 15m signals)",
+     title            = "Nifty ORB — HA Filter (4 Modes)",
      shorttitle        = "ORB-HA",
      overlay           = true,
      initial_capital   = 100000,
@@ -10,180 +10,224 @@ strategy(
      commission_value  = 0.05
  )
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // INPUTS
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
-i_show_range      = input.bool (true,  "Show Opening Range levels",      group = "Display")
-i_comfort_tight   = input.bool (true,  "Enable HA Comfort Tightening",   group = "Strategy")
-i_swing_bars      = input.int  (2,     "Swing point lookback bars",       group = "Strategy", minval = 1, maxval = 5)
-i_tick            = input.float(0.05,  "Tick size (stop offset)",         group = "Strategy", step = 0.05)
+// HA Filter mode (Step 3)
+i_ha_mode = input.string(
+     "STRICT",
+     "HA Filter Mode",
+     options  = ["STRICT", "RELAXED", "REVERSAL", "LIVE_HA"],
+     tooltip  = "STRICT: closed HA must be green/red.\n"
+              + "RELAXED: allows flat/doji HA (set tolerance below).\n"
+              + "REVERSAL: take breakout against HA (tightened SL).\n"
+              + "LIVE_HA: enter when unclosed HA is turning your way.",
+     group    = "Step 3: HA Filter"
+ )
+i_relaxed_ticks = input.float(
+     2.0,
+     "Relaxed tolerance (ticks)",
+     tooltip = "RELAXED only: closed HA close must be >= open - N ticks (CE) or <= open + N ticks (PE).",
+     group   = "Step 3: HA Filter"
+ )
 
-// Time windows  (all IST = UTC+5:30, chart must be set to Asia/Kolkata)
-i_range_session   = input.session("0915-1015", "Opening range session",   group = "Sessions")
-i_trade_session   = input.session("1015-1300", "Trade window (entry)",    group = "Sessions")
-i_eod_exit_time   = input.int   (1500,         "Force-exit time (HHMM)",  group = "Sessions")
+// Display
+i_show_range      = input.bool(true,  "Show Opening Range levels",    group = "Display")
+i_show_mode_label = input.bool(true,  "Show filter mode label",       group = "Display")
 
-// ═══════════════════════════════════════════════════════════════════════════
+// Strategy
+i_comfort_tight   = input.bool(true,  "Enable HA Comfort Tightening", group = "Strategy")
+i_swing_bars      = input.int (2,     "Swing point lookback bars",     group = "Strategy", minval = 1, maxval = 5)
+i_tick            = input.float(0.05, "Tick size (stop offset)",       group = "Strategy", step = 0.05)
+
+// Sessions
+i_range_session   = input.session("0915-1015", "Opening range session",  group = "Sessions")
+i_trade_session   = input.session("1015-1300", "Trade window (entry)",   group = "Sessions")
+i_eod_exit_time   = input.int   (1500,         "Force-exit time (HHMM)", group = "Sessions")
+
+// ============================================================================
 // MULTI-TIMEFRAME DATA
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
-// 1H Heikin-Ashi (for opening range + HA filter + comfort indicator)
 ha_sym = ticker.heikinashi(syminfo.tickerid)
 
+// Last CLOSED 1H HA candle (lookahead OFF = safe for backtesting)
 [ha1h_o, ha1h_h, ha1h_l, ha1h_c] = request.security(
-     ha_sym, "60",
-     [open, high, low, close],
-     lookahead = barmerge.lookahead_off
- )
+     ha_sym, "60", [open, high, low, close],
+     lookahead = barmerge.lookahead_off)
 
-// Current (live, possibly unclosed) 1H HA candle — for comfort check
+// LIVE (unclosed) 1H HA candle — for LIVE_HA mode and comfort check
 [ha1h_o_live, ha1h_h_live, ha1h_l_live, ha1h_c_live] = request.security(
-     ha_sym, "60",
-     [open, high, low, close],
-     lookahead = barmerge.lookahead_on   // intentionally look ahead for live candle colour
- )
+     ha_sym, "60", [open, high, low, close],
+     lookahead = barmerge.lookahead_on)
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // SESSION / TIME HELPERS
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
-in_range_session  = not na(time("15", i_range_session))   // 15m bars in 09:15–10:15
-in_trade_session  = not na(time("15", i_trade_session))   // 15m bars in 10:15–13:00
+in_range_session = not na(time("15", i_range_session))
+in_trade_session = not na(time("15", i_trade_session))
+is_new_day       = ta.change(dayofmonth) != 0
 
-// True on the very first bar of each calendar day
-is_new_day = dayofweek != dayofweek[1] or (year != year[1])
-
-// Force-exit: any 15m bar at or after i_eod_exit_time
 eod_hour   = i_eod_exit_time / 100
 eod_minute = i_eod_exit_time % 100
 past_eod   = (hour > eod_hour) or (hour == eod_hour and minute >= eod_minute)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STEP 1 — OPENING RANGE (first 1H HA candle: 09:15–10:15)
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// STEP 1 — OPENING RANGE  (first 1H HA candle: 09:15-10:15)
+// ============================================================================
 
-var float orb_high = na
-var float orb_low  = na
+var float orb_high  = na
+var float orb_low   = na
 var bool  range_set = false
-
-// The first 1H HA bar of the day spans 09:15–10:15.
-// We capture it on the first 15m bar AFTER 10:15 (i.e. the 10:15 bar close),
-// so the 1H candle is fully formed.
-range_capture_bar = (hour == 10 and minute == 15) and not range_set
 
 if is_new_day
     orb_high  := na
     orb_low   := na
     range_set := false
 
-if range_capture_bar
-    orb_high  := ha1h_h    // high of the closed 09:15-10:15 HA candle
-    orb_low   := ha1h_l    // low  of the closed 09:15-10:15 HA candle
+if (hour == 10 and minute == 15) and not range_set
+    orb_high  := ha1h_h
+    orb_low   := ha1h_l
     range_set := true
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STEP 2 — 1H HA FILTER  (most recently CLOSED 1H HA candle)
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// STEP 2 — HA FILTER VALUES  (pre-computed for all modes)
+// ============================================================================
 
-ha1h_green_closed = ha1h_c > ha1h_o     // last CLOSED 1H HA candle is green
-ha1h_red_closed   = ha1h_c < ha1h_o     // last CLOSED 1H HA candle is red
+// Closed 1H HA delta (positive = green, negative = red)
+ha1h_delta_closed = ha1h_c - ha1h_o
 
-// Live (unclosed) 1H HA candle colour — for comfort tightening
+// Closed candle colour helpers
+ha1h_green_closed = ha1h_c > ha1h_o
+ha1h_red_closed   = ha1h_c < ha1h_o
+
+// Live candle delta
+ha1h_delta_live   = ha1h_c_live - ha1h_o_live
 ha1h_live_green   = ha1h_c_live > ha1h_o_live
 ha1h_live_red     = ha1h_c_live < ha1h_o_live
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STEP 3 — ENTRY LOGIC
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// STEP 3 — HA FILTER  (mode-aware)
+// ============================================================================
+// Returns true/false for CE and PE entries based on the selected mode.
 
-var bool  trade_taken = false    // one trade per day
-var int   pos         = 0        // 1 = long (CE), -1 = short (PE), 0 = flat
+// Option A (RELAXED): allow if closed HA is not strongly opposing
+f_relaxed_ce = ha1h_delta_closed >= -i_relaxed_ticks
+f_relaxed_pe = ha1h_delta_closed <= i_relaxed_ticks
+
+// CE filter gate
+ha_filter_ce =
+     i_ha_mode == "STRICT"   ? ha1h_green_closed :
+     i_ha_mode == "RELAXED"  ? f_relaxed_ce :
+     i_ha_mode == "REVERSAL" ? true :                     // Option B: always enter
+     i_ha_mode == "LIVE_HA"  ? (ha1h_delta_live > 0) :   // Option C: live HA turning green
+     false
+
+// PE filter gate
+ha_filter_pe =
+     i_ha_mode == "STRICT"   ? ha1h_red_closed :
+     i_ha_mode == "RELAXED"  ? f_relaxed_pe :
+     i_ha_mode == "REVERSAL" ? true :
+     i_ha_mode == "LIVE_HA"  ? (ha1h_delta_live < 0) :
+     false
+
+// REVERSAL mode: tighten initial SL to breakout candle low/high
+is_reversal_against = (i_ha_mode == "REVERSAL") and
+     (ha1h_red_closed or ha1h_green_closed)   // HA opposes direction
+
+// ============================================================================
+// STEP 4 — ENTRY LOGIC
+// ============================================================================
+
+var bool  trade_taken = false
+var int   pos         = 0        // 1 = long, -1 = short, 0 = flat
 var float entry_price = na
-var float stop_level  = na       // current trailing stop
+var float stop_level  = na
+var bool  is_tight_sl = false    // true when REVERSAL mode tightened the SL
 
-// Reset daily trade flag
 if is_new_day
     trade_taken := false
     pos         := 0
     stop_level  := na
+    is_tight_sl := false
 
-// 15m close breakout conditions (standard OHLC close — `close` on 15m chart)
-bullish_breakout = range_set and in_trade_session and close > orb_high and ha1h_green_closed
-bearish_breakout = range_set and in_trade_session and close < orb_low  and ha1h_red_closed
+bullish_breakout = range_set and in_trade_session and (close > orb_high) and ha_filter_ce
+bearish_breakout = range_set and in_trade_session and (close < orb_low)  and ha_filter_pe
 
-// Entry — first valid signal only
 if not trade_taken and pos == 0
+
     if bullish_breakout
+        // REVERSAL: SL = breakout candle low; otherwise SL = ORB low
+        sl_init     = (i_ha_mode == "REVERSAL" and ha1h_red_closed)
+                      ? (low - i_tick) : orb_low
         pos         := 1
         entry_price := close
-        stop_level  := orb_low
+        stop_level  := sl_init
+        is_tight_sl := (i_ha_mode == "REVERSAL" and ha1h_red_closed)
         trade_taken := true
         strategy.entry("Long CE", strategy.long)
         strategy.exit("Long SL", from_entry = "Long CE", stop = stop_level)
 
     else if bearish_breakout
+        sl_init     = (i_ha_mode == "REVERSAL" and ha1h_green_closed)
+                      ? (high + i_tick) : orb_high
         pos         := -1
         entry_price := close
-        stop_level  := orb_high
+        stop_level  := sl_init
+        is_tight_sl := (i_ha_mode == "REVERSAL" and ha1h_green_closed)
         trade_taken := true
         strategy.entry("Short PE", strategy.short)
         strategy.exit("Short SL", from_entry = "Short PE", stop = stop_level)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STEP 4 — HARD INVALIDATION  (candle CLOSES beyond stop before entry filled)
-// ═══════════════════════════════════════════════════════════════════════════
-// (handled by strategy.exit stop above; belt-and-suspenders below)
+// ============================================================================
+// STEP 5 — HARD INVALIDATION
+// ============================================================================
 
-if pos == 1  and close < orb_low
-    strategy.close("Long CE",  comment = "Invalidation close < Low1")
-    pos        := 0
-    stop_level := na
+if pos == 1 and close < orb_low
+    strategy.close("Long CE",  comment = "Invalidated: close < Low1")
+    pos        := 0;  stop_level := na
 
 if pos == -1 and close > orb_high
-    strategy.close("Short PE", comment = "Invalidation close > High1")
-    pos        := 0
-    stop_level := na
+    strategy.close("Short PE", comment = "Invalidated: close > High1")
+    pos        := 0;  stop_level := na
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STEP 5 — TRAILING STOP  (standard 15m swing points)
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// STEP 6 — TRAILING STOP  (15m standard swing points)
+// ============================================================================
 
-// Swing low: low[i_swing_bars] is lower than i_swing_bars bars on each side
 swing_low_val  = ta.pivotlow (low,  i_swing_bars, i_swing_bars)
 swing_high_val = ta.pivothigh(high, i_swing_bars, i_swing_bars)
 
 if pos == 1 and not na(swing_low_val)
     new_stop = swing_low_val - i_tick
-    if new_stop > stop_level   // only move stop UP (ratchet)
+    if new_stop > stop_level
         stop_level := new_stop
         strategy.exit("Long Trail", from_entry = "Long CE", stop = stop_level)
 
 if pos == -1 and not na(swing_high_val)
     new_stop = swing_high_val + i_tick
-    if new_stop < stop_level   // only move stop DOWN (ratchet)
+    if new_stop < stop_level
         stop_level := new_stop
         strategy.exit("Short Trail", from_entry = "Short PE", stop = stop_level)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STEP 6 — HA COMFORT TIGHTENING  (discretionary, one-time per flip)
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// STEP 7 — HA COMFORT TIGHTENING
+// ============================================================================
 
 var bool comfort_tightened = false
-
 if is_new_day
     comfort_tightened := false
 
 if i_comfort_tight and not comfort_tightened
-    // Long: live 1H HA turns red → tighten stop to previous 15m candle low
     if pos == 1 and ha1h_live_red
-        tight_stop = low[1] - i_tick    // previous closed 15m standard candle low
+        tight_stop = low[1] - i_tick
         if tight_stop > stop_level
             stop_level        := tight_stop
             comfort_tightened := true
             strategy.exit("Long Comfort", from_entry = "Long CE", stop = stop_level)
 
-    // Short: live 1H HA turns green → tighten stop to previous 15m candle high
     if pos == -1 and ha1h_live_green
         tight_stop = high[1] + i_tick
         if tight_stop < stop_level
@@ -191,59 +235,66 @@ if i_comfort_tight and not comfort_tightened
             comfort_tightened := true
             strategy.exit("Short Comfort", from_entry = "Short PE", stop = stop_level)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STEP 7 — EOD FORCE-EXIT
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
+// STEP 8 — EOD FORCE-EXIT
+// ============================================================================
 
 if pos != 0 and past_eod
-    strategy.close_all(comment = "EOD force-exit")
+    strategy.close_all(comment = "EOD")
     pos        := 0
     stop_level := na
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
 // VISUALS
-// ═══════════════════════════════════════════════════════════════════════════
+// ============================================================================
 
-// Opening range bands
 plot(i_show_range and range_set ? orb_high : na,
-     "ORB High", color = color.new(color.green, 0), linewidth = 2, style = plot.style_line)
-plot(i_show_range and range_set ? orb_low  : na,
-     "ORB Low",  color = color.new(color.red,   0), linewidth = 2, style = plot.style_line)
+     "ORB High", color = color.new(color.green, 0), linewidth = 2)
+plot(i_show_range and range_set ? orb_low : na,
+     "ORB Low",  color = color.new(color.red,   0), linewidth = 2)
 
-// Entry / stop markers
-plotshape(pos == 1  and pos[1] == 0, "Long  entry", shape.triangleup,
+plotshape(pos == 1  and pos[1] == 0, "Long",  shape.triangleup,
           location.belowbar, color.green, size = size.small)
-plotshape(pos == -1 and pos[1] == 0, "Short entry", shape.triangledown,
+plotshape(pos == -1 and pos[1] == 0, "Short", shape.triangledown,
           location.abovebar, color.red,   size = size.small)
 
-// Live stop level
-plot(pos != 0 ? stop_level : na, "Trailing Stop",
+// Mark REVERSAL entries differently
+plotshape(pos == 1  and pos[1] == 0 and is_tight_sl, "Long Reversal",
+          shape.circle, location.belowbar, color.new(color.orange, 0), size = size.tiny)
+plotshape(pos == -1 and pos[1] == 0 and is_tight_sl, "Short Reversal",
+          shape.circle, location.abovebar, color.new(color.orange, 0), size = size.tiny)
+
+plot(pos != 0 ? stop_level : na, "Stop",
      color = color.new(color.orange, 0), linewidth = 1, style = plot.style_linebr)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// INFO TABLE
-// ═══════════════════════════════════════════════════════════════════════════
-
-var table info = table.new(position.top_right, 2, 6,
+// Info table
+var table info = table.new(position.top_right, 2, 7,
      bgcolor = color.new(color.black, 70), border_width = 1)
 
 if barstate.islast
-    table.cell(info, 0, 0, "ORB High",  text_color = color.white, text_size = size.small)
-    table.cell(info, 1, 0, range_set ? str.tostring(orb_high, "#.##") : "–",
+    table.cell(info, 0, 0, "Mode",      text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 0, i_ha_mode,
+               text_color = color.yellow, text_size = size.small)
+    table.cell(info, 0, 1, "ORB High",  text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 1, range_set ? str.tostring(orb_high, "#.##") : "-",
                text_color = color.lime, text_size = size.small)
-    table.cell(info, 0, 1, "ORB Low",   text_color = color.white, text_size = size.small)
-    table.cell(info, 1, 1, range_set ? str.tostring(orb_low,  "#.##") : "–",
+    table.cell(info, 0, 2, "ORB Low",   text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 2, range_set ? str.tostring(orb_low,  "#.##") : "-",
                text_color = color.red,  text_size = size.small)
-    table.cell(info, 0, 2, "Position",  text_color = color.white, text_size = size.small)
-    table.cell(info, 1, 2, pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "FLAT",
+    table.cell(info, 0, 3, "Position",  text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 3, pos == 1 ? "LONG" : pos == -1 ? "SHORT" : "FLAT",
                text_color = pos == 1 ? color.lime : pos == -1 ? color.red : color.gray,
                text_size = size.small)
-    table.cell(info, 0, 3, "Stop",      text_color = color.white, text_size = size.small)
-    table.cell(info, 1, 3, not na(stop_level) ? str.tostring(stop_level, "#.##") : "–",
+    table.cell(info, 0, 4, "Stop",      text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 4, not na(stop_level) ? str.tostring(stop_level, "#.##") : "-",
                text_color = color.orange, text_size = size.small)
-    table.cell(info, 0, 4, "1H HA",     text_color = color.white, text_size = size.small)
-    table.cell(info, 1, 4, ha1h_green_closed ? "GREEN" : ha1h_red_closed ? "RED" : "DOJI",
+    table.cell(info, 0, 5, "HA Closed", text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 5,
+               ha1h_green_closed ? "GREEN +" + str.tostring(math.round(ha1h_delta_closed, 1)) :
+               ha1h_red_closed   ? "RED "   + str.tostring(math.round(ha1h_delta_closed, 1)) : "DOJI",
                text_color = ha1h_green_closed ? color.lime : color.red, text_size = size.small)
-    table.cell(info, 0, 5, "Comfort",   text_color = color.white, text_size = size.small)
-    table.cell(info, 1, 5, comfort_tightened ? "TIGHTENED" : "ACTIVE",
-               text_color = comfort_tightened ? color.orange : color.gray, text_size = size.small)
+    table.cell(info, 0, 6, "HA Live",   text_color = color.white, text_size = size.small)
+    table.cell(info, 1, 6,
+               ha1h_live_green ? "GREEN +" + str.tostring(math.round(ha1h_delta_live, 1)) :
+               ha1h_live_red   ? "RED "    + str.tostring(math.round(ha1h_delta_live, 1)) : "FLAT",
+               text_color = ha1h_live_green ? color.lime : color.red, text_size = size.small)
