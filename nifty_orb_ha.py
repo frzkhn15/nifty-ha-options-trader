@@ -93,9 +93,10 @@ OPTION_CHAIN_CACHE_TTL  = 600
 #              above open for CE, below for PE) — before the hour closes.
 #              Earliest possible entry; requires tight risk management.
 
-HA_FILTER_MODE   = "STRICT"   # "STRICT" | "RELAXED" | "REVERSAL" | "LIVE_HA"
-RELAXED_TICKS    = 2          # Option A: min pts that HA close must exceed open
-                               # (use 0 to allow pure doji)
+# All four modes run simultaneously — each manages its own position independently.
+# To disable a mode, remove it from this list.
+ALL_MODES      = ["STRICT", "RELAXED", "REVERSAL", "LIVE_HA"]
+RELAXED_TICKS  = 2     # RELAXED only: tolerance in pts (0 = allow pure doji)
 
 # Comfort tightening
 ENABLE_COMFORT_TIGHTEN  = True
@@ -115,25 +116,35 @@ CSV_HEADERS = ["date", "signal", "filter_mode", "tight_sl",
 # GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Opening range
+# Opening range (shared across all modes)
 ORB_HIGH: Optional[float] = None
 ORB_LOW:  Optional[float] = None
 ORB_SET:  bool            = False
 
-# Position
-ACTIVE_POSITION: dict     = {}
-TRADE_TAKEN:     bool     = False   # one trade per day
+# ── Per-mode state ────────────────────────────────────────────────────────────
+# Each key is a mode string ("STRICT", "RELAXED", "REVERSAL", "LIVE_HA").
+# This replaces the single ACTIVE_POSITION / TRADE_TAKEN / COMFORT_TIGHTENED.
 
-# Comfort tightening state
-COMFORT_TIGHTENED: bool   = False
-LAST_HA1H_COLOR:   str    = "none"  # "green" | "red" | "none"
+def _fresh_mode_state() -> dict:
+    """Return a clean per-mode state dict."""
+    return {
+        "position":         {},      # identical structure to old ACTIVE_POSITION
+        "trade_taken":      False,
+        "comfort_tightened": False,
+        "last_ha1h_color":  "none",
+    }
 
-# Option chain cache
+MODE_STATE: dict = {m: _fresh_mode_state() for m in ["STRICT", "RELAXED", "REVERSAL", "LIVE_HA"]}
+
+# Option chain cache (shared)
 OPTION_CHAIN_CACHE: dict          = {}
 LAST_CHAIN_FETCH:   Optional[datetime] = None
 
-# Dedup: last 15m candle bar-time that triggered a check (prevent re-fire)
+# Dedup: last 15m bar-time checked — shared (all modes look at the same bar)
 LAST_CHECKED_BAR: Optional[datetime] = None
+
+# Daily P&L summary across all modes
+DAILY_PNL_BY_MODE: dict = {m: 0.0 for m in ["STRICT", "RELAXED", "REVERSAL", "LIVE_HA"]}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP
@@ -332,14 +343,17 @@ def get_live_1h_ha_color(df_1h: pd.DataFrame) -> str:
 # ENTRY SCANNER
 # ─────────────────────────────────────────────────────────────────────────────
 
-def scan_entry(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[dict]:
+def scan_entry(df_15m: pd.DataFrame, df_1h: pd.DataFrame,
+               mode: str) -> Optional[dict]:
     """
-    Check the last CLOSED 15m standard candle for an ORB breakout.
+    Check the last CLOSED 15m standard candle for an ORB breakout,
+    applying the filter logic for the given mode.
     Returns signal dict or None.
     """
     global LAST_CHECKED_BAR
 
-    if not ORB_SET or TRADE_TAKEN:
+    ms = MODE_STATE[mode]
+    if not ORB_SET or ms["trade_taken"]:
         return None
     if df_15m is None or len(df_15m) < 3:
         return None
@@ -352,11 +366,12 @@ def scan_entry(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[dict]:
     bar      = df_15m.iloc[-2]
     bar_time = bar["datetime"]
 
-    # Dedup: don't re-check the same bar on every 30s scan tick
+    # Dedup on bar time is SHARED — all modes see the same bar at the same time.
+    # We do NOT set LAST_CHECKED_BAR here; the caller sets it after all modes
+    # have been checked for this bar so none are skipped.
     if LAST_CHECKED_BAR is not None and bar_time <= LAST_CHECKED_BAR:
         return None
 
-    LAST_CHECKED_BAR = bar_time
     ha_row      = get_closed_1h_ha_row(df_1h)
     ha_color    = get_last_closed_1h_ha_color(df_1h)
     live_delta  = get_live_ha_delta(df_1h)    # for LIVE_HA mode
@@ -368,10 +383,9 @@ def scan_entry(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[dict]:
 
     if DEBUG_MODE:
         live_str = f"{live_delta:+.1f}" if live_delta is not None else "n/a"
-        print(f"   [{bar_time.strftime('%H:%M')}] "
+        print(f"   [{mode}][{bar_time.strftime('%H:%M')}] "
               f"close={bar['close']:.2f} | ORB H={ORB_HIGH:.2f} L={ORB_LOW:.2f} | "
-              f"1H HA closed={ha_color}({ha_delta:+.1f}pts) live_delta={live_str} | "
-              f"mode={HA_FILTER_MODE}")
+              f"1H HA closed={ha_color}({ha_delta:+.1f}pts) live_delta={live_str}")
 
     # ── CE breakout ────────────────────────────────────────────────────────────
     if bar["close"] > ORB_HIGH:
@@ -379,39 +393,39 @@ def scan_entry(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[dict]:
         tight_sl  = False   # True → use breakout candle low as SL (Option B)
         reason    = ""
 
-        if HA_FILTER_MODE == "STRICT":
+        if mode == "STRICT":
             ce_ok  = (ha_color == "green")
             reason = f"1H HA {ha_color} (need green)"
 
-        elif HA_FILTER_MODE == "RELAXED":
+        elif mode == "RELAXED":
             # Allow if closed HA is NOT deeply red (delta >= -RELAXED_TICKS)
             ce_ok  = (ha_delta >= -RELAXED_TICKS)
             reason = f"1H HA delta {ha_delta:+.1f} < -{RELAXED_TICKS} ticks"
 
-        elif HA_FILTER_MODE == "REVERSAL":
+        elif mode == "REVERSAL":
             # Always take the breakout; if HA is red, tighten SL to bar low
             ce_ok   = True
             tight_sl = (ha_color == "red")
             reason  = ""
 
-        elif HA_FILTER_MODE == "LIVE_HA":
+        elif mode == "LIVE_HA":
             # Enter if live (unclosed) 1H HA is turning green (delta > 0)
             ce_ok  = (live_delta is not None and live_delta > 0)
             reason = f"live 1H HA delta {live_delta:+.1f} (need > 0)"
 
         if ce_ok:
             mode_note = (f"tight SL to bar low {bar['low']:.2f}" if tight_sl
-                         else f"1H HA {ha_color} ({HA_FILTER_MODE})")
-            print(f"\n   ✅ CE SIGNAL [{HA_FILTER_MODE}]: "
+                         else f"1H HA {ha_color} ({mode})")
+            print(f"\n   ✅ CE SIGNAL [{mode}]: "
                   f"close {bar['close']:.2f} > ORB High {ORB_HIGH:.2f} | {mode_note}")
             return {"signal": "CE", "bar_time": bar_time,
                     "bar_close": bar["close"], "bar_low": bar["low"],
                     "bar_high": bar["high"],
                     "ha_color": ha_color, "tight_sl": tight_sl,
-                    "filter_mode": HA_FILTER_MODE}
+                    "filter_mode": mode}
         else:
             if DEBUG_MODE:
-                print(f"   ⛔ CE blocked [{HA_FILTER_MODE}]: {reason}")
+                print(f"   ⛔ [{mode}] CE blocked: {reason}")
 
     # ── PE breakout ────────────────────────────────────────────────────────────
     if bar["close"] < ORB_LOW:
@@ -419,37 +433,37 @@ def scan_entry(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[dict]:
         tight_sl  = False
         reason    = ""
 
-        if HA_FILTER_MODE == "STRICT":
+        if mode == "STRICT":
             pe_ok  = (ha_color == "red")
             reason = f"1H HA {ha_color} (need red)"
 
-        elif HA_FILTER_MODE == "RELAXED":
+        elif mode == "RELAXED":
             # Allow if closed HA is NOT deeply green (delta <= RELAXED_TICKS)
             pe_ok  = (ha_delta <= RELAXED_TICKS)
             reason = f"1H HA delta {ha_delta:+.1f} > +{RELAXED_TICKS} ticks"
 
-        elif HA_FILTER_MODE == "REVERSAL":
+        elif mode == "REVERSAL":
             pe_ok   = True
             tight_sl = (ha_color == "green")
             reason  = ""
 
-        elif HA_FILTER_MODE == "LIVE_HA":
+        elif mode == "LIVE_HA":
             pe_ok  = (live_delta is not None and live_delta < 0)
             reason = f"live 1H HA delta {live_delta:+.1f} (need < 0)"
 
         if pe_ok:
             mode_note = (f"tight SL to bar high {bar['high']:.2f}" if tight_sl
-                         else f"1H HA {ha_color} ({HA_FILTER_MODE})")
-            print(f"\n   ✅ PE SIGNAL [{HA_FILTER_MODE}]: "
+                         else f"1H HA {ha_color} ({mode})")
+            print(f"\n   ✅ PE SIGNAL [{mode}]: "
                   f"close {bar['close']:.2f} < ORB Low {ORB_LOW:.2f} | {mode_note}")
             return {"signal": "PE", "bar_time": bar_time,
                     "bar_close": bar["close"], "bar_low": bar["low"],
                     "bar_high": bar["high"],
                     "ha_color": ha_color, "tight_sl": tight_sl,
-                    "filter_mode": HA_FILTER_MODE}
+                    "filter_mode": mode}
         else:
             if DEBUG_MODE:
-                print(f"   ⛔ PE blocked [{HA_FILTER_MODE}]: {reason}")
+                print(f"   ⛔ [{mode}] PE blocked: {reason}")
 
     return None
 
@@ -457,81 +471,82 @@ def scan_entry(df_15m: pd.DataFrame, df_1h: pd.DataFrame) -> Optional[dict]:
 # TRAILING STOP UPDATE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def update_trailing_stop(df_15m: pd.DataFrame):
+def update_trailing_stop(df_15m: pd.DataFrame, mode: str):
     """
     Ratchet the trailing stop using 15m swing points.
     CE: stop moves UP to (swing_low - TICK).
     PE: stop moves DOWN to (swing_high + TICK).
     Stop only moves in the favourable direction.
     """
-    if not ACTIVE_POSITION:
+    pos = MODE_STATE[mode]["position"]
+    if not pos:
         return
 
-    opt       = ACTIVE_POSITION["type"]
-    cur_stop  = ACTIVE_POSITION["stop"]
+    opt       = pos["type"]
+    cur_stop  = pos["stop"]
 
     if opt == "CE":
         sl = last_swing_low(df_15m)
         if sl is not None:
             new_stop = round(sl - TICK, 2)
             if new_stop > cur_stop:
-                ACTIVE_POSITION["stop"] = new_stop
+                pos["stop"] = new_stop
                 if DEBUG_MODE:
-                    print(f"   🔼 Trail raised: ₹{cur_stop:.2f} → ₹{new_stop:.2f} "
+                    print(f"   [{mode}] 🔼 Trail raised: ₹{cur_stop:.2f} → ₹{new_stop:.2f} "
                           f"(swing low {sl:.2f})")
     elif opt == "PE":
         sh = last_swing_high(df_15m)
         if sh is not None:
             new_stop = round(sh + TICK, 2)
             if new_stop < cur_stop:
-                ACTIVE_POSITION["stop"] = new_stop
+                pos["stop"] = new_stop
                 if DEBUG_MODE:
-                    print(f"   🔽 Trail lowered: ₹{cur_stop:.2f} → ₹{new_stop:.2f} "
+                    print(f"   [{mode}] 🔽 Trail lowered: ₹{cur_stop:.2f} → ₹{new_stop:.2f} "
                           f"(swing high {sh:.2f})")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # HA COMFORT TIGHTENING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_comfort_tighten(df_15m: pd.DataFrame, df_1h: pd.DataFrame):
+def check_comfort_tighten(df_15m: pd.DataFrame, df_1h: pd.DataFrame, mode: str):
     """
     If the live (unclosed) 1H HA candle flips against the position,
     tighten the stop to the previous 15m standard candle low/high.
     One-time per flip — resets if HA flips back then flips again.
     """
-    global COMFORT_TIGHTENED, LAST_HA1H_COLOR
-
-    if not ENABLE_COMFORT_TIGHTEN or not ACTIVE_POSITION or COMFORT_TIGHTENED:
+    ms = MODE_STATE[mode]
+    if not ENABLE_COMFORT_TIGHTEN or not ms["position"] or ms["comfort_tightened"]:
         return
     if df_15m is None or len(df_15m) < 2:
         return
 
     live_color = get_live_1h_ha_color(df_1h)
-    opt        = ACTIVE_POSITION["type"]
-    cur_stop   = ACTIVE_POSITION["stop"]
+    pos        = ms["position"]
+    opt        = pos["type"]
+    cur_stop   = pos["stop"]
 
     # Detect flip: colour must have CHANGED since last check
-    if live_color == LAST_HA1H_COLOR:
+    if live_color == ms["last_ha1h_color"]:
         return
 
-    LAST_HA1H_COLOR = live_color
+    ms["last_ha1h_color"] = live_color
     prev_bar = df_15m.iloc[-2]   # last closed 15m standard candle
 
     if opt == "CE" and live_color == "red":
         tight_stop = round(prev_bar["low"] - TICK, 2)
         if tight_stop > cur_stop:
-            ACTIVE_POSITION["stop"] = tight_stop
-            COMFORT_TIGHTENED       = True
-            print(f"   🟡 Comfort tighten (CE): 1H HA turned RED → "
+            pos["stop"]                 = tight_stop
+            ms["comfort_tightened"]     = True
+            print(f"   [{mode}] 🟡 Comfort tighten (CE): 1H HA turned RED → "
                   f"stop ₹{cur_stop:.2f} → ₹{tight_stop:.2f} "
                   f"(prev 15m low {prev_bar['low']:.2f})")
 
     elif opt == "PE" and live_color == "green":
         tight_stop = round(prev_bar["high"] + TICK, 2)
         if tight_stop < cur_stop:
-            ACTIVE_POSITION["stop"] = tight_stop
-            COMFORT_TIGHTENED       = True
-            print(f"   🟡 Comfort tighten (PE): 1H HA turned GREEN → "
+            pos["stop"]                 = tight_stop
+            ms["comfort_tightened"]     = True
+            print(f"   [{mode}] 🟡 Comfort tighten (PE): 1H HA turned GREEN → "
                   f"stop ₹{cur_stop:.2f} → ₹{tight_stop:.2f} "
                   f"(prev 15m high {prev_bar['high']:.2f})")
 
@@ -650,8 +665,8 @@ def cancel_order(oid: str):
 # ENTRY EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def execute_entry(signal: dict):
-    global ACTIVE_POSITION, TRADE_TAKEN, COMFORT_TIGHTENED, LAST_HA1H_COLOR
+def execute_entry(signal: dict, mode: str):
+    ms = MODE_STATE[mode]
 
     opt = signal["signal"]
     print(f"\n{'='*60}")
@@ -718,7 +733,7 @@ def execute_entry(signal: dict):
     buy_id = place_order(contract["instrument_key"], qty, "BUY", "LIMIT", entry_lmt)
     if not buy_id:
         print("   ❌ BUY order failed")
-        TRADE_TAKEN = False
+        ms["trade_taken"] = False
         return
     print(f"   ✅ BUY: {buy_id}")
 
@@ -728,7 +743,7 @@ def execute_entry(signal: dict):
     else:
         print("   ⚠️  SL order failed!")
 
-    ACTIVE_POSITION = {
+    ms["position"] = {
         "key":    contract["instrument_key"],
         "symbol": contract.get("trading_symbol"),
         "type":   opt,
@@ -740,68 +755,70 @@ def execute_entry(signal: dict):
         "time":   datetime.now(),
         "signal": signal,
     }
-    _log_entry(signal, contract, premium, spot, buy_id)
+    _log_entry(signal, contract, premium, spot, buy_id, mode)
     print(f"{'='*60}\n")
 
 
-def update_exchange_sl():
+def update_exchange_sl(mode: str):
     """Replace the exchange SL order with the current (trailed/tightened) stop."""
-    if not ACTIVE_POSITION or not ENABLE_AUTO_TRADING:
+    pos = MODE_STATE[mode]["position"]
+    if not pos or not ENABLE_AUTO_TRADING:
         return
-    old_id   = ACTIVE_POSITION.get("sl_id")
-    opt      = ACTIVE_POSITION["type"]
-    stop     = ACTIVE_POSITION["stop"]
-    sl_lmt   = round(stop * 0.995 if opt == "CE" else stop * 1.005, 2)
+    old_id = pos.get("sl_id")
+    opt    = pos["type"]
+    stop   = pos["stop"]
+    sl_lmt = round(stop * 0.995 if opt == "CE" else stop * 1.005, 2)
     if old_id:
         cancel_order(old_id)
-    new_id = place_order(ACTIVE_POSITION["key"], ACTIVE_POSITION["qty"],
-                         "SELL", "SL", sl_lmt, stop)
+    new_id = place_order(pos["key"], pos["qty"], "SELL", "SL", sl_lmt, stop)
     if new_id:
-        ACTIVE_POSITION["sl_id"] = new_id
+        pos["sl_id"] = new_id
         if DEBUG_MODE:
-            print(f"   🔄 SL order updated: {new_id} @ ₹{stop:.2f}")
+            print(f"   [{mode}] 🔄 SL updated: {new_id} @ ₹{stop:.2f}")
     else:
-        print("   ⚠️  SL update failed — stop is in-memory only!")
+        print(f"   [{mode}] ⚠️  SL update failed — in-memory only!")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # EXIT
 # ─────────────────────────────────────────────────────────────────────────────
 
 def check_exit(df_15m: Optional[pd.DataFrame] = None,
-               df_1h:  Optional[pd.DataFrame] = None):
-    global ACTIVE_POSITION
-
-    if not ACTIVE_POSITION:
+               df_1h:  Optional[pd.DataFrame] = None,
+               mode:   str = "STRICT"):
+    global DAILY_PNL_BY_MODE
+    ms  = MODE_STATE[mode]
+    pos = ms["position"]
+    if not pos:
         return
 
-    ltp = get_ltp(ACTIVE_POSITION["key"])
+    ltp = get_ltp(pos["key"])
     if not ltp:
         return
 
-    opt    = ACTIVE_POSITION["type"]
-    entry  = ACTIVE_POSITION["entry"]
-    stop   = ACTIVE_POSITION["stop"]
-    qty    = ACTIVE_POSITION["qty"]
-    pnl    = (ltp - entry) * qty
-    pnl_p  = (ltp - entry) / entry * 100
-    t      = datetime.now().strftime("%H:%M")
+    opt   = pos["type"]
+    entry = pos["entry"]
+    stop  = pos["stop"]
+    qty   = pos["qty"]
+    pnl   = (ltp - entry) * qty
+    pnl_p = (ltp - entry) / entry * 100
+    t     = datetime.now().strftime("%H:%M")
     reason = None
 
     # Update trailing stop (15m swings)
     if df_15m is not None:
-        prev_stop = ACTIVE_POSITION["stop"]
-        update_trailing_stop(df_15m)
-        if ACTIVE_POSITION["stop"] != prev_stop:
-            update_exchange_sl()
+        prev_stop = pos["stop"]
+        update_trailing_stop(df_15m, mode)
+        if pos["stop"] != prev_stop:
+            update_exchange_sl(mode)
 
     # HA comfort tightening check
     if df_1h is not None:
-        prev_stop = ACTIVE_POSITION["stop"]
-        check_comfort_tighten(df_15m, df_1h)
-        if ACTIVE_POSITION["stop"] != prev_stop:
-            update_exchange_sl()
+        prev_stop = pos["stop"]
+        check_comfort_tighten(df_15m, df_1h, mode)
+        if pos["stop"] != prev_stop:
+            update_exchange_sl(mode)
 
-    stop = ACTIVE_POSITION["stop"]   # refresh after possible update
+    stop = pos["stop"]   # refresh after possible update
 
     # Hard invalidation: candle CLOSES beyond ORB level
     if df_15m is not None and len(df_15m) >= 2:
@@ -811,7 +828,7 @@ def check_exit(df_15m: Optional[pd.DataFrame] = None,
         elif opt == "PE" and last_close > ORB_HIGH:
             reason = "INVALIDATION_CLOSE_ABOVE_HIGH1"
 
-    # SL hit (LTP-based for intraday responsiveness)
+    # SL hit
     if not reason:
         if opt == "CE" and ltp <= stop:
             reason = "SL_HIT"
@@ -824,33 +841,33 @@ def check_exit(df_15m: Optional[pd.DataFrame] = None,
 
     if not reason:
         if DEBUG_MODE:
-            print(f"   📊 {ACTIVE_POSITION['symbol']} | "
+            print(f"   [{mode}] 📊 {pos['symbol']} | "
                   f"LTP ₹{ltp:.2f} | Stop ₹{stop:.2f} | "
                   f"P&L ₹{pnl:+.0f} ({pnl_p:+.1f}%)")
         return
 
     print(f"\n{'='*60}")
-    print(f"🔚 EXIT: {reason} | {ACTIVE_POSITION['symbol']}")
+    print(f"[{mode}] 🔚 EXIT: {reason} | {pos['symbol']}")
     print(f"   Entry ₹{entry:.2f} → ₹{ltp:.2f} | P&L ₹{pnl:+.0f} ({pnl_p:+.1f}%)")
 
     if ENABLE_AUTO_TRADING:
-        if ACTIVE_POSITION.get("sl_id"):
-            cancel_order(ACTIVE_POSITION["sl_id"])
-        eid = place_order(ACTIVE_POSITION["key"], qty, "SELL", "MARKET")
+        if pos.get("sl_id"):
+            cancel_order(pos["sl_id"])
+        eid = place_order(pos["key"], qty, "SELL", "MARKET")
         print(f"   {'✅ ' + eid if eid else '⚠️  Exit FAILED — close manually!'}")
 
-    _log_exit(ACTIVE_POSITION, ltp, reason, pnl, pnl_p)
-    ACTIVE_POSITION = {}
+    DAILY_PNL_BY_MODE[mode] = DAILY_PNL_BY_MODE.get(mode, 0.0) + pnl
+    _log_exit(pos, ltp, reason, pnl, pnl_p)
+    ms["position"] = {}
     print(f"{'='*60}\n")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _log_entry(signal, contract, premium, spot, order_id):
+def _log_entry(signal, contract, premium, spot, order_id, mode="?"):
     with open(LOG_FILE, "a") as f:
-        f.write(f"\nENTRY {datetime.now()} | {signal['signal']} | "
-                f"mode={signal.get('filter_mode','STRICT')} | "
+        f.write(f"\nENTRY {datetime.now()} | [{mode}] {signal['signal']} | "
                 f"tight_sl={signal.get('tight_sl', False)} | "
                 f"bar={signal['bar_time'].strftime('%H:%M')} | "
                 f"close={signal['bar_close']:.2f} | "
@@ -890,13 +907,8 @@ def banner():
     print(f"  Mode          : {'LIVE' if ENABLE_AUTO_TRADING else 'SIGNAL ONLY'}")
     print(f"  Opening range : 09:15–10:15 (first 1H HA candle)")
     print(f"  Entry window  : {ENTRY_START}–{ENTRY_END} (15m breakout)")
-    mode_desc = {
-        "STRICT"  : "Closed 1H HA must agree (green/red)",
-        "RELAXED" : f"Closed HA delta >= -{RELAXED_TICKS} ticks (allows doji/flat)",
-        "REVERSAL": "Reversal play — breakout taken regardless, SL tightened to bar",
-        "LIVE_HA" : "Live (unclosed) 1H HA must be turning in entry direction",
-    }.get(HA_FILTER_MODE, HA_FILTER_MODE)
-    print(f"  HA filter     : [{HA_FILTER_MODE}] {mode_desc}")
+    print(f"  HA modes      : {' | '.join(ALL_MODES)} (all running simultaneously)")
+    print(f"  RELAXED ticks : ±{RELAXED_TICKS} pts")
     print(f"  Initial SL    : ORB Low1 (CE) / High1 (PE)")
     print(f"  Trailing SL   : 15m swing points (lookback {SWING_BARS} bars each side)")
     print(f"  Comfort tight : {'ON' if ENABLE_COMFORT_TIGHTEN else 'OFF'} "
@@ -910,8 +922,7 @@ def banner():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    global ORB_HIGH, ORB_LOW, ORB_SET, TRADE_TAKEN
-    global ACTIVE_POSITION, COMFORT_TIGHTENED, LAST_HA1H_COLOR
+    global ORB_HIGH, ORB_LOW, ORB_SET, MODE_STATE, DAILY_PNL_BY_MODE
     global OPTION_CHAIN_CACHE, LAST_CHAIN_FETCH, LAST_CHECKED_BAR
 
     banner()
@@ -929,54 +940,80 @@ def main():
 
             # EOD reset
             if t >= "15:30":
-                print(f"📊 Session done")
+                total = sum(DAILY_PNL_BY_MODE.values())
+                print(f"\n📊 Session done | Total P&L ₹{total:+.0f}")
+                for m in ALL_MODES:
+                    print(f"   [{m}] ₹{DAILY_PNL_BY_MODE.get(m, 0):+.0f}")
                 ORB_HIGH = ORB_LOW = None; ORB_SET = False
-                TRADE_TAKEN = False; ACTIVE_POSITION = {}
-                COMFORT_TIGHTENED = False; LAST_HA1H_COLOR = "none"
+                MODE_STATE = {m: _fresh_mode_state() for m in ["STRICT","RELAXED","REVERSAL","LIVE_HA"]}
+                DAILY_PNL_BY_MODE = {m: 0.0 for m in ALL_MODES}
                 OPTION_CHAIN_CACHE.clear(); LAST_CHAIN_FETCH = None
                 LAST_CHECKED_BAR = None
                 time.sleep(300)
                 continue
 
             scan += 1
-            df1   = fetch_1min()
-            df15  = get_15m(df1)
-            df1h  = get_1h(df1)
-            n15   = len(df15) if df15 is not None else 0
-            n1h   = len(df1h) if df1h is not None else 0
+            df1  = fetch_1min()
+            df15 = get_15m(df1)
+            df1h = get_1h(df1)
+            n15  = len(df15) if df15 is not None else 0
+            n1h  = len(df1h) if df1h is not None else 0
 
+            # Build status line per mode
+            mode_status = " | ".join(
+                f"[{m[0]}]{'📈' if MODE_STATE[m]['position'].get('type')=='CE' else '📉' if MODE_STATE[m]['position'].get('type')=='PE' else '—'}"
+                for m in ALL_MODES
+            )
             print(f"🔍 #{scan} {now.strftime('%H:%M:%S')} | "
-                  f"15m={n15} 1H={n1h} | "
-                  f"ORB={'SET' if ORB_SET else 'pending'} | "
-                  f"trade={'taken' if TRADE_TAKEN else 'available'} | "
-                  f"pos={'YES' if ACTIVE_POSITION else 'no'}",
+                  f"15m={n15} 1H={n1h} | ORB={'SET' if ORB_SET else 'pending'} | "
+                  f"{mode_status}",
                   flush=True)
 
             # ── Step 1: Capture ORB after 10:15 ──────────────────────────────
             if t >= RANGE_CAPTURE_TIME and not ORB_SET:
                 capture_orb(df1h)
 
-            # ── Step 2/3: Entry scan ──────────────────────────────────────────
-            if ORB_SET and not TRADE_TAKEN and not ACTIVE_POSITION:
-                sig = scan_entry(df15, df1h)
-                if sig:
-                    execute_entry(sig)
+            # ── Step 2/3: Entry scan — run for every mode ─────────────────────
+            # Capture the current bar's time once, then mark it done so all
+            # modes share the dedup without any mode skipping this bar.
+            if ORB_SET:
+                new_bar_available = False
+                if df15 is not None and len(df15) >= 2:
+                    candidate = df15.iloc[-2]["datetime"]
+                    if LAST_CHECKED_BAR is None or candidate > LAST_CHECKED_BAR:
+                        new_bar_available = True
 
-            # ── Exit management ───────────────────────────────────────────────
-            if ACTIVE_POSITION:
-                check_exit(df15, df1h)
+                if new_bar_available:
+                    for mode in ALL_MODES:
+                        ms = MODE_STATE[mode]
+                        if not ms["trade_taken"] and not ms["position"]:
+                            sig = scan_entry(df15, df1h, mode)
+                            if sig:
+                                execute_entry(sig, mode)
+                    # Mark bar as checked AFTER all modes have seen it
+                    if df15 is not None and len(df15) >= 2:
+                        LAST_CHECKED_BAR = df15.iloc[-2]["datetime"]
+
+            # ── Exit management — run for every active mode ───────────────────
+            for mode in ALL_MODES:
+                if MODE_STATE[mode]["position"]:
+                    check_exit(df15, df1h, mode)
 
             # ── EOD force-exit ────────────────────────────────────────────────
-            if ACTIVE_POSITION and t >= EOD_EXIT_TIME:
-                print("⏰ EOD force-exit triggered")
-                check_exit(df15, df1h)
+            if t >= EOD_EXIT_TIME:
+                for mode in ALL_MODES:
+                    if MODE_STATE[mode]["position"]:
+                        print(f"⏰ [{mode}] EOD force-exit")
+                        check_exit(df15, df1h, mode)
 
             time.sleep(SCAN_INTERVAL_SECS)
 
         except KeyboardInterrupt:
             print("\n⛔ Stopped by user")
-            if ACTIVE_POSITION and ENABLE_AUTO_TRADING:
-                check_exit()
+            for mode in ALL_MODES:
+                if MODE_STATE[mode]["position"] and ENABLE_AUTO_TRADING:
+                    check_exit(df15 if "df15" in dir() else None,
+                               df1h  if "df1h"  in dir() else None, mode)
             sys.exit(0)
         except Exception as e:
             print(f"⚠️  {e}")
