@@ -34,12 +34,26 @@ from typing import Optional
 # CONFIGURATION  (all tunables in one place)
 # ─────────────────────────────────────────────────────────────────────────────
 
-ACCESS_TOKEN = os.environ.get("UPSTOX_TOKEN")
+# ── Token setup ──────────────────────────────────────────────────────────────
+# Option A (env var):
+#   Windows CMD : set UPSTOX_TOKEN=eyJ...
+#   Windows PS  : $env:UPSTOX_TOKEN="eyJ..."
+#   Linux/Mac   : export UPSTOX_TOKEN="eyJ..."
+# Option B (hardcode): paste your token between the quotes on the next line
+HARDCODED_TOKEN = ""   # ← paste token here
+
+ACCESS_TOKEN = os.environ.get("UPSTOX_TOKEN") or HARDCODED_TOKEN.strip()
 if not ACCESS_TOKEN:
-    raise ValueError(
-        "\n❌  Set UPSTOX_TOKEN before running:\n"
-        "      export UPSTOX_TOKEN='your_token_here'\n"
-    )
+    import platform
+    is_win = platform.system() == "Windows"
+    print("\n❌  UPSTOX_TOKEN not set.")
+    if is_win:
+        print("  Windows CMD : set UPSTOX_TOKEN=eyJ...")
+        print("  Windows PS  : $env:UPSTOX_TOKEN=\"eyJ...\"")
+    else:
+        print("  Linux/Mac   : export UPSTOX_TOKEN=\'eyJ...\'")
+    print("  Or paste token in HARDCODED_TOKEN in the script.\n")
+    sys.exit(1)
 
 # API
 NIFTY_INDEX_KEY  = "NSE_INDEX|Nifty 50"
