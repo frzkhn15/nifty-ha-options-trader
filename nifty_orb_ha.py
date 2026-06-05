@@ -43,12 +43,31 @@ from scipy.signal import lfilter
 # CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
 
-ACCESS_TOKEN = os.environ.get("UPSTOX_TOKEN")
+# ── Token: paste directly here OR set as environment variable ────────────────
+# Option 1 (recommended): set env var before running
+#   Windows CMD : set UPSTOX_TOKEN=eyJ0eX...
+#   Windows PS  : $env:UPSTOX_TOKEN="eyJ0eX..."
+#   Linux/Mac   : export UPSTOX_TOKEN="eyJ0eX..."
+#
+# Option 2 (quick): paste your token between the quotes below
+HARDCODED_TOKEN = ""   # ← paste token here if not using env var
+
+ACCESS_TOKEN = os.environ.get("UPSTOX_TOKEN") or HARDCODED_TOKEN.strip()
+
 if not ACCESS_TOKEN:
-    raise ValueError(
-        "\n❌  Set UPSTOX_TOKEN before running:\n"
-        "      export UPSTOX_TOKEN='your_token_here'\n"
-    )
+    import platform
+    is_win = platform.system() == "Windows"
+    print("\n❌  UPSTOX_TOKEN not set.  Choose one of:")
+    print("\n  Option A — set env var before running the script:")
+    if is_win:
+        print("    CMD:        set UPSTOX_TOKEN=eyJ0eX...")
+        print("    PowerShell: $env:UPSTOX_TOKEN=\"eyJ0eX...\"")
+    else:
+        print("    export UPSTOX_TOKEN=\'eyJ0eX...\'")
+    print("\n  Option B — paste token directly in the script:")
+    print("    Open the .py file, find HARDCODED_TOKEN = \"\"")
+    print("    and paste your token between the quotes.\n")
+    sys.exit(1)
 
 NIFTY_INDEX_KEY  = "NSE_INDEX|Nifty 50"
 NIFTY_OPTION_KEY = "NSE_INDEX|Nifty 50"
